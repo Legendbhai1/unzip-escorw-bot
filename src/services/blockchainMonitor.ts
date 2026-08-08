@@ -1,0 +1,349 @@
+import { prisma } from "../lib/db.js";
+import { treasuryService } from "./treasuryService.js";
+import { tronService } from "./tronService.js";
+import { bscService } from "./bscService.js";
+import { getUserDepositAddress } from "./depositAddressService.js";
+import { notificationService } from "./notificationService.js";
+import { logger } from "../lib/logger.js";
+import { config } from "../config/index.js";
+import { redis } from "../lib/redis.js";
+import type { DetectedTransaction } from "../types/index.js";
+
+const lastPollTimestamp = new Map<string, number>();
+
+/**
+ * Blockchain Monitor detects incoming deposits and credits USER WALLETS.
+ * Deposits are NOT deal-specific. They go to user available balance.
+ *
+ * Idempotency: network + txHash + logIndex (composite unique in DB).
+ * For TRC20 where logIndex isn't available from API, use 0.
+ */
+export const blockchainMonitor = {
+  /**
+   * Process a detected deposit.
+   * 1. Check if (network, txHash, logIndex) already processed
+   * 2. Determine which user owns the deposit address
+   * 3. Credit the user's available balance via TreasuryService
+   * 4. Notify user
+   */
+  async processDeposit(detected: DetectedTransaction) {
+    const { txHash, toAddress, amount, confirmations, network, fromAddress } = detected;
+    const txHashLower = txHash.toLowerCase();
+    const logIndex = (detected as any).logIndex ?? 0;
+
+    // 1. Idempotency: check blockchain_deposits with composite key
+    try {
+      // Use txHash as unique key for idempotency check (composite index is at DB level)
+      const existing = await prisma.blockchainDeposit.findFirst({
+        where: { txHash: txHashLower, network, logIndex },
+      });
+      if (existing) {
+        if (existing.status === "CONFIRMED") return null;
+
+        // Update confirmations for pending deposits
+        if (confirmations >= existing.requiredConfs && existing.status === "PENDING") {
+          return this.confirmAndCredit(existing.id, txHashLower, amount, network, fromAddress);
+        }
+        return null;
+      }
+    } catch (e) {
+      // If the unique constraint lookup fails, it might be a migration issue.
+      // Fall through to try creating.
+      logger.warn({ err: e, txHash: txHashLower, network }, "Blockchain deposit lookup error");
+    }
+
+    // 2. Determine user from deposit address
+    // For MVP with static addresses: we can't determine user from address alone.
+    // The deposit is recorded as PENDING for admin attribution.
+    const userId = await this.resolveUserId(toAddress, network, txHashLower, fromAddress);
+
+    if (!userId) {
+      // Record as pending — admin must attribute manually
+      await prisma.blockchainDeposit.create({
+        data: {
+          userId: "00000000-0000-0000-0000-000000000001", // unattributed
+          txHash: txHashLower,
+          logIndex,
+          fromAddress,
+          toAddress,
+          asset: "USDT",
+          network,
+          amount,
+          confirmations,
+          requiredConfs: this.getMinConfirmations(network),
+          status: "PENDING",
+        },
+      });
+      logger.warn(
+        { txHash: txHashLower, amount, network, toAddress },
+        "Deposit recorded as pending (user attribution needed)"
+      );
+      return null;
+    }
+
+    // 3. Check if we have enough confirmations
+    const requiredConfs = this.getMinConfirmations(network);
+    if (confirmations < requiredConfs) {
+      await prisma.blockchainDeposit.create({
+        data: {
+          userId,
+          txHash: txHashLower,
+          logIndex,
+          fromAddress,
+          toAddress,
+          asset: "USDT",
+          network,
+          amount,
+          confirmations,
+          requiredConfs,
+          status: "PENDING",
+        },
+      });
+      logger.info(
+        { txHash: txHashLower, confirmations, requiredConfs, userId },
+        "Deposit pending confirmations"
+      );
+      return null;
+    }
+
+    // 4. Credit user via TreasuryService
+    try {
+      await treasuryService.creditDeposit({
+        userId,
+        amount,
+        asset: "USDT",
+        txHash: txHashLower,
+        network,
+        logIndex,
+        fromAddress,
+        toAddress,
+      });
+
+      await notificationService.notifyDepositCredited(userId, "USDT", amount, txHashLower);
+      logger.info(
+        { txHash: txHashLower, userId, amount, network },
+        "Deposit credited to user wallet"
+      );
+      return { userId, amount, txHash: txHashLower };
+    } catch (e: any) {
+      if (e.message?.includes("IDEMPOTENT_DUPLICATE")) {
+        logger.warn({ txHash: txHashLower }, "Deposit already credited (idempotent)");
+        return null;
+      }
+      logger.error({ txHash: txHashLower, userId, err: e }, "Failed to credit deposit");
+      return null;
+    }
+  },
+
+  /**
+   * Confirm a pending deposit and credit the user's wallet.
+   */
+  async confirmAndCredit(
+    depositId: string,
+    txHash: string,
+    amount: string,
+    network: string,
+    fromAddress: string,
+  ) {
+    const deposit = await prisma.blockchainDeposit.findUnique({ where: { id: depositId } });
+    if (!deposit) return null;
+    if (deposit.userId === "00000000-0000-0000-0000-000000000001") {
+      logger.warn({ depositId }, "Cannot credit unattributed deposit");
+      return null;
+    }
+
+    try {
+      await treasuryService.creditDeposit({
+        userId: deposit.userId,
+        amount,
+        asset: deposit.asset,
+        txHash,
+        network,
+        logIndex: deposit.logIndex,
+        fromAddress,
+        toAddress: deposit.toAddress,
+      });
+
+      await prisma.blockchainDeposit.update({
+        where: { id: depositId },
+        data: { status: "CONFIRMED", creditedAt: new Date() },
+      });
+
+      await notificationService.notifyDepositCredited(
+        deposit.userId, deposit.asset, amount, txHash
+      );
+
+      return deposit;
+    } catch (e: any) {
+      if (e.message?.includes("IDEMPOTENT_DUPLICATE")) {
+        await prisma.blockchainDeposit.update({
+          where: { id: depositId },
+          data: { status: "CONFIRMED", creditedAt: new Date() },
+        });
+        return deposit;
+      }
+      logger.error({ depositId, err: e }, "Failed to credit pending deposit");
+      return null;
+    }
+  },
+
+  /**
+   * Resolve userId from a deposit address.
+   * For static addresses, returns null (unattributed).
+   * In production with per-user HD addresses, this would look up
+   * address -> userId mapping.
+   */
+  async resolveUserId(
+    toAddress: string,
+    network: string,
+    txHash: string,
+    fromAddress: string,
+  ): Promise<string | null> {
+    const staticAddr = process.env[`DEPOSIT_ADDRESS_${network}`];
+    if (staticAddr && staticAddr.toLowerCase() === toAddress.toLowerCase()) {
+      // Static address: can't determine user from address alone.
+      // Production improvement: use memo/tag or require user to register their TX.
+      return null;
+    }
+
+    // For per-user derived addresses, we'd need a reverse lookup.
+    // This is a placeholder for HD wallet implementation.
+    return null;
+  },
+
+  getMinConfirmations(network: string): number {
+    const map: Record<string, number> = {
+      TRC20: 20, BEP20: 15, BTC: 3, LTC: 6, TON: 10, ERC20: 12,
+    };
+    return map[network] ?? 12;
+  },
+
+  /**
+   * TRON TRC20 polling.
+   */
+  async pollTron() {
+    try {
+      const addresses = await getMonitoredAddresses();
+      if (addresses.length === 0) {
+        logger.debug("No TRC20 addresses to monitor");
+        return;
+      }
+
+      const minTs = lastPollTimestamp.get("TRC20") ?? (Date.now() - 300_000);
+      const latestBlock = await tronService.getLatestBlock();
+
+      for (const addr of addresses) {
+        const transfers = await tronService.getTrc20Transfers(addr, undefined, minTs);
+
+        for (let i = 0; i < transfers.length; i++) {
+          const t = transfers[i];
+          // Attach logIndex for TRC20 (use index within batch as approximation)
+          const detected = {
+            ...tronService.parseTrc20Transfer(t, latestBlock),
+            logIndex: i, // TRC20 API doesn't give logIndex, use batch index
+          };
+          await this.processDeposit(detected);
+        }
+      }
+
+      lastPollTimestamp.set("TRC20", Date.now());
+    } catch (e) {
+      logger.error({ err: e }, "TRON poll error");
+    }
+  },
+
+  /**
+   * BSC BEP20 polling — uses ethers.js event logs.
+   */
+  async pollBsc() {
+    try {
+      const addresses = await getMonitoredAddresses();
+      if (addresses.length === 0) {
+        logger.debug("No BEP20 addresses to monitor");
+        return;
+      }
+
+      const currentBlock = await bscService.getLatestBlock();
+      const lastKey = "BEP20:lastBlock";
+      const rawLast = await redis.get(lastKey);
+      const fromBlock = rawLast ? Number(rawLast) + 1 : currentBlock - 1000;
+      const safeFrom = Math.max(fromBlock, currentBlock - 5000);
+
+      for (const addr of addresses) {
+        const transfers = await bscService.getBep20Transfers(addr, safeFrom, currentBlock);
+
+        for (const t of transfers) {
+          await this.processDeposit(t);
+        }
+      }
+
+      await redis.set(lastKey, currentBlock.toString());
+      lastPollTimestamp.set("BEP20", Date.now());
+    } catch (e) {
+      logger.error({ err: e }, "BSC poll error");
+    }
+  },
+
+  /**
+   * Check pending deposits that may now have enough confirmations.
+   */
+  async confirmPendingDeposits() {
+    const pending = await prisma.blockchainDeposit.findMany({
+      where: { status: "PENDING" },
+      take: 100,
+    });
+
+    for (const dep of pending) {
+      if (dep.userId === "00000000-0000-0000-0000-000000000001") continue;
+
+      // Check current confirmations
+      let currentConfs = dep.confirmations;
+      if (dep.network === "BEP20") {
+        currentConfs = await bscService.getTxConfirmations(dep.txHash);
+      }
+      // TRC20: would need another API call; skip for now
+
+      if (currentConfs >= dep.requiredConfs) {
+        await this.confirmAndCredit(
+          dep.id, dep.txHash, dep.amount.toString(), dep.network, dep.fromAddress
+        );
+      }
+    }
+  },
+
+  /**
+   * Start the polling loop.
+   */
+  startPolling() {
+    const interval = config.monitorPollIntervalMs;
+    logger.info({ intervalMs: interval }, "Blockchain monitor started");
+
+    const poll = async () => {
+      try {
+        await this.pollTron();
+        await this.pollBsc();
+        await this.confirmPendingDeposits();
+      } catch (e) {
+        logger.error({ err: e }, "Blockchain monitor poll error");
+      }
+    };
+
+    poll();
+    setInterval(poll, interval);
+  },
+};
+
+/**
+ * Get all monitored deposit addresses.
+ * Returns unique platform addresses for all active users.
+ */
+async function getMonitoredAddresses(): Promise<string[]> {
+  const staticAddrTRC20 = process.env.DEPOSIT_ADDRESS_TRC20;
+  const staticAddrBEP20 = process.env.DEPOSIT_ADDRESS_BEP20;
+
+  const addresses: string[] = [];
+  if (staticAddrTRC20) addresses.push(staticAddrTRC20);
+  if (staticAddrBEP20) addresses.push(staticAddrBEP20);
+
+  return [...new Set(addresses)];
+}
