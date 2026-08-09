@@ -315,7 +315,9 @@ export const blockchainMonitor = {
 
       lastPollTimestamp.set("TRC20", Date.now());
     } catch (e) {
-      logger.error({ err: e }, "TRON poll error");
+      // Route through the throttled logger: repeated identical errors (RPC
+      // outage, missing tables) must not spam the logs every poll cycle.
+      logMonitorError(e);
     }
   },
 
@@ -347,7 +349,10 @@ export const blockchainMonitor = {
       await redis.set(lastKey, currentBlock.toString());
       lastPollTimestamp.set("BEP20", Date.now());
     } catch (e) {
-      logger.error({ err: e }, "BSC poll error");
+      // Route through the throttled logger: Redis may be unavailable (the app
+      // intentionally falls back to in-memory sessions), and BSC polling must
+      // not log an error every cycle in that case.
+      logMonitorError(e);
     }
   },
 
