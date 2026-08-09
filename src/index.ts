@@ -1,8 +1,31 @@
+import http from "node:http";
 import { config } from "./config/index.js";
 import { logger } from "./lib/logger.js";
 import { redis } from "./lib/redis.js";
 import { bot } from "./bot/index.js";
 import { blockchainMonitor } from "./services/blockchainMonitor.js";
+
+/**
+ * Render (and similar platforms) determine web-service readiness by whether
+ * the app listens on the injected PORT. This bot uses long polling and never
+ * opened an HTTP port, so deploys would sit in "update_in_progress" forever.
+ * Bind a minimal health endpoint (0.0.0.0) so the deploy can go live. The
+ * endpoint is intentionally dumb — all real work happens via Telegram polling.
+ */
+function startHealthServer(): http.Server | null {
+  const port = Number(process.env.PORT ?? 8080);
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  });
+  server.on("error", (err) => {
+    logger.warn({ err, port }, "Health server could not bind port (continuing without it)");
+  });
+  server.listen(port, "0.0.0.0", () => {
+    logger.info({ port }, "Health server listening");
+  });
+  return server;
+}
 
 /**
  * Start the bot, retrying on Telegram 409 "terminated by other getUpdates
@@ -54,6 +77,7 @@ async function main() {
   }
 
   logger.info("Starting escrow bot...");
+  startHealthServer();
   await startBotWithRetry();
 }
 
