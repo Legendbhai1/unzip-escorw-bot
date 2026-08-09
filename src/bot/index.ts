@@ -35,28 +35,50 @@ bot.api.config.use((prev, method, payload, signal) => {
 });
 
 // ─── Session Middleware (Redis-backed with in-memory fallback) ─────────
+// Redis provides cross-instance sessions. When Redis is unavailable (no
+// REDIS_URL configured) we fall back to an in-process Map so multi-step
+// flows (deal form, payment report, evidence) still work on a single
+// instance. Without this fallback the session step is never persisted, the
+// first text step of the form (the counterparty username) is silently
+// dropped, and the bot never advances past "Enter the username".
+const memorySessionStore = new Map<string, string>();
+let redisOk = false;
+
+/** Called from src/index.ts after the Redis connect attempt. */
+export function setSessionRedisOk(ok: boolean) {
+  redisOk = ok;
+}
+
 bot.use(session({
   initial: (): SessionData => ({
     userId: "", telegramId: 0, username: null, firstName: "",
   }),
   storage: {
     async read(key: string) {
+      const memory = memorySessionStore.get(key);
       try {
-        const v = await redis.get(`session:${key}`);
-        return v ? JSON.parse(v) : undefined;
-      } catch {
-        return undefined;
-      }
+        if (redisOk) {
+          const v = await redis.get(`session:${key}`);
+          if (v) return JSON.parse(v);
+        }
+      } catch { /* fall through to memory */ }
+      return memory ? JSON.parse(memory) : undefined;
     },
     async write(key: string, val: unknown) {
+      const data = JSON.stringify(val);
       try {
-        await redis.set(`session:${key}`, JSON.stringify(val), "EX", 86400);
-      } catch { /* ignore */ }
+        if (redisOk) {
+          await redis.set(`session:${key}`, data, "EX", 86400);
+          return;
+        }
+      } catch { /* fall through to memory */ }
+      memorySessionStore.set(key, data);
     },
     async delete(key: string) {
       try {
-        await redis.del(`session:${key}`);
+        if (redisOk) await redis.del(`session:${key}`);
       } catch { /* ignore */ }
+      memorySessionStore.delete(key);
     },
   },
 }));

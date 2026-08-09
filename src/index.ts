@@ -3,6 +3,7 @@ import { config } from "./config/index.js";
 import { logger } from "./lib/logger.js";
 import { redis } from "./lib/redis.js";
 import { bot } from "./bot/index.js";
+import { setSessionRedisOk } from "./bot/index.js";
 
 /**
  * Render (and similar platforms) determine web-service readiness by whether
@@ -66,9 +67,12 @@ async function startBotWithRetry(attempt = 0): Promise<void> {
 }
 
 async function main() {
-  await redis.connect().catch(() => {
-    logger.warn("Redis not available, sessions will be in-memory");
-  });
+  await redis.connect().then(
+    () => setSessionRedisOk(true),
+    () => {
+      logger.warn("Redis not available, sessions will be in-memory");
+    }
+  );
 
   // The automated blockchain deposit monitor is DISABLED: the bot no longer
   // receives or credits funds automatically. All payments are manually
