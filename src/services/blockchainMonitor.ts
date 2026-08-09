@@ -11,6 +11,10 @@ import type { DetectedTransaction } from "../types/index.js";
 
 const lastPollTimestamp = new Map<string, number>();
 
+// Only USDT is supported as a deposit asset. Deposits of any other token are
+// ignored — token verification must never be weakened.
+const SUPPORTED_ASSET = "USDT";
+
 // System user used to record deposits that cannot be attributed to a user
 // (e.g. static platform deposit address). Never credited automatically.
 const UNATTRIBUTED_USER_ID = "00000000-0000-0000-0000-000000000001";
@@ -78,6 +82,17 @@ export const blockchainMonitor = {
     const { txHash, toAddress, amount, confirmations, network, fromAddress } = detected;
     const txHashLower = txHash.toLowerCase();
     const logIndex = (detected as any).logIndex ?? 0;
+
+    // Token verification: only USDT is supported as a deposit asset. Detectors
+    // filter at the source, but this guard must never be weakened — a foreign
+    // token (or spoofed symbol) reaching this point is ignored outright.
+    if (detected.token !== SUPPORTED_ASSET) {
+      logger.warn(
+        { txHash: txHashLower, token: detected.token, network, toAddress },
+        "Deposit skipped: unsupported token"
+      );
+      return null;
+    }
 
     // 1. Idempotency: check blockchain_deposits with composite key
     try {

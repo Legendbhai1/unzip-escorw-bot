@@ -297,104 +297,125 @@ export const treasuryService = {
     const { userId, amount, asset, txHash, network, logIndex = 0, fromAddress = "", toAddress = "" } = params;
     const idempotencyKey = `deposit:${network}:${txHash.toLowerCase()}:${logIndex}`;
 
-    // Record blockchain deposit (separate from ledger)
-    // Upsert on the composite unique (network, txHash, logIndex) so the
-    // same on-chain event can never create a duplicate tracking row.
-    await prisma.blockchainDeposit.upsert({
-      where: {
-        blockchain_deposit_unique: {
-          network,
-          txHash: txHash.toLowerCase(),
-          logIndex,
-        },
-      },
-      create: {
-        userId,
-        txHash: txHash.toLowerCase(),
-        logIndex,
-        fromAddress,
-        toAddress,
-        asset,
-        network,
-        amount,
-        status: "CONFIRMED",
-        creditedAt: new Date(),
-      },
-      update: { status: "CONFIRMED", creditedAt: new Date() },
-    }).catch(() => {
-      // Unique constraint violation means it already exists - that's fine
-    });
-
-    // For deposits, we allow non-zero net since money comes from outside the system.
-    // We bypass the net-zero check by executing directly.
+    // Pre-check idempotency on the LedgerTransaction idempotency key.
+    // The unique constraint on idempotency_key is the hard guarantee against
+    // double-crediting, even under concurrent pollers.
     if (await checkIdempotency(idempotencyKey)) {
       logger.warn({ idempotencyKey }, "Idempotency: deposit already credited");
       throw new Error(`IDEMPOTENT_DUPLICATE:${idempotencyKey}`);
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      // Lock and read user balance
-      const rows = await tx.$queryRaw<
-        Array<{ userId: string; asset: string; available: string; locked: string }>
-      >(
-        Prisma.sql`SELECT user_id as "userId", asset, available, locked
-          FROM balances WHERE user_id = ${userId}::uuid AND asset = ${asset}
-          FOR UPDATE`
-      );
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Reserve the deposit tracking row with the composite unique key
+        // (network, txHash, logIndex). If it already exists (e.g. as PENDING
+        // from an earlier poll), leave its status unchanged — it is promoted
+        // to CONFIRMED only AFTER the ledger credit succeeds, so a failed
+        // credit can never be mistaken for a credited deposit.
+        await tx.blockchainDeposit.upsert({
+          where: {
+            blockchain_deposit_unique: {
+              network,
+              txHash: txHash.toLowerCase(),
+              logIndex,
+            },
+          },
+          create: {
+            userId,
+            txHash: txHash.toLowerCase(),
+            logIndex,
+            fromAddress,
+            toAddress,
+            asset,
+            network,
+            amount,
+            status: "PENDING",
+          },
+          update: {},
+        });
 
-      let available = dec(0);
-      let locked = dec(0);
-      if (rows.length > 0) {
-        available = dec(rows[0].available);
-        locked = dec(rows[0].locked);
-      }
+        // Lock and read user balance
+        const rows = await tx.$queryRaw<
+          Array<{ userId: string; asset: string; available: string; locked: string }>
+        >(
+          Prisma.sql`SELECT user_id as "userId", asset, available, locked
+            FROM balances WHERE user_id = ${userId}::uuid AND asset = ${asset}
+            FOR UPDATE`
+        );
 
-      available = available.add(dec(amount));
-      const balanceAfter = available.add(locked);
+        let available = dec(0);
+        let locked = dec(0);
+        if (rows.length > 0) {
+          available = dec(rows[0].available);
+          locked = dec(rows[0].locked);
+        }
 
-      await tx.balance.upsert({
-        where: { userId_asset: { userId, asset } },
-        create: { userId, asset, available, locked },
-        update: { available },
-      });
+        available = available.add(dec(amount));
+        const balanceAfter = available.add(locked);
 
-      const ledgerTx = await tx.ledgerTransaction.create({
-        data: {
-          type: "DEPOSIT",
-          asset,
-          amount,
-          network,
-          idempotencyKey,
-          referenceType: "BLOCKCHAIN_DEPOSIT",
-        },
-      });
+        await tx.balance.upsert({
+          where: { userId_asset: { userId, asset } },
+          create: { userId, asset, available, locked },
+          update: { available },
+        });
 
-      await tx.ledgerEntry.create({
-        data: {
+        const ledgerTx = await tx.ledgerTransaction.create({
+          data: {
+            type: "DEPOSIT",
+            asset,
+            amount,
+            network,
+            idempotencyKey,
+            referenceType: "BLOCKCHAIN_DEPOSIT",
+          },
+        });
+
+        await tx.ledgerEntry.create({
+          data: {
+            ledgerTxId: ledgerTx.id,
+            userId,
+            type: "DEPOSIT",
+            amount, // positive
+            asset,
+            balanceAfter: balanceAfter.toString(),
+            referenceType: "BLOCKCHAIN_DEPOSIT",
+          },
+        });
+
+        // Promote the deposit to CONFIRMED atomically with the credit.
+        await tx.blockchainDeposit.updateMany({
+          where: {
+            network,
+            txHash: txHash.toLowerCase(),
+            logIndex,
+          },
+          data: { status: "CONFIRMED", creditedAt: new Date() },
+        });
+
+        return {
           ledgerTxId: ledgerTx.id,
-          userId,
-          type: "DEPOSIT",
-          amount, // positive
-          asset,
-          balanceAfter: balanceAfter.toString(),
-          referenceType: "BLOCKCHAIN_DEPOSIT",
-        },
+          idempotencyKey,
+          entries: [{ userId, amount, balanceAfter: balanceAfter.toString(), type: "DEPOSIT" }],
+        };
       });
 
-      return {
-        ledgerTxId: ledgerTx.id,
-        idempotencyKey,
-        entries: [{ userId, amount, balanceAfter: balanceAfter.toString(), type: "DEPOSIT" }],
-      };
-    });
+      // Create user-facing transaction record
+      await prisma.transaction.create({
+        data: { userId, type: "DEPOSIT", asset, amount, status: "CONFIRMED", txHash },
+      });
 
-    // Create user-facing transaction record
-    await prisma.transaction.create({
-      data: { userId, type: "DEPOSIT", asset, amount, status: "CONFIRMED", txHash },
-    });
-
-    logger.info({ ledgerTxId: result.ledgerTxId, userId, amount, asset, network, txHash }, "Deposit credited");
-    return result;
+      logger.info({ ledgerTxId: result.ledgerTxId, userId, amount, asset, network, txHash }, "Deposit credited");
+      return result;
+    } catch (e: any) {
+      // A unique-constraint violation on the ledger idempotency key means a
+      // concurrent poll already credited this deposit. Surface it as an
+      // idempotency error so callers don't retry or report a hard failure.
+      if (e?.code === "P2002" || e?.message?.includes("unique")) {
+        logger.warn({ idempotencyKey }, "Idempotency: deposit already credited (concurrent)");
+        throw new Error(`IDEMPOTENT_DUPLICATE:${idempotencyKey}`);
+      }
+      throw e;
+    }
   },
 
   /**
