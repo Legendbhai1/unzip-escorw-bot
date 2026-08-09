@@ -17,6 +17,8 @@ async function cleanAll() {
   await prisma.adminAction.deleteMany();
   await prisma.disputeEvidence.deleteMany();
   await prisma.dispute.deleteMany();
+  await prisma.escrowAuditLog.deleteMany();
+  await prisma.paymentReport.deleteMany();
   await prisma.ledgerEntry.deleteMany();
   await prisma.ledgerTransaction.deleteMany();
   await prisma.transaction.deleteMany();

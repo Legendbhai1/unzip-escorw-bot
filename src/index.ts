@@ -3,7 +3,6 @@ import { config } from "./config/index.js";
 import { logger } from "./lib/logger.js";
 import { redis } from "./lib/redis.js";
 import { bot } from "./bot/index.js";
-import { blockchainMonitor } from "./services/blockchainMonitor.js";
 
 /**
  * Render (and similar platforms) determine web-service readiness by whether
@@ -71,10 +70,10 @@ async function main() {
     logger.warn("Redis not available, sessions will be in-memory");
   });
 
-  if (config.nodeEnv !== "test") {
-    blockchainMonitor.startPolling();
-    logger.info("Blockchain monitor started");
-  }
+  // The automated blockchain deposit monitor is DISABLED: the bot no longer
+  // receives or credits funds automatically. All payments are manually
+  // verified by the escrower outside the bot. (The monitor code remains in
+  // src/services/blockchainMonitor.ts for historical/audit reference only.)
 
   logger.info("Starting escrow bot...");
   startHealthServer();

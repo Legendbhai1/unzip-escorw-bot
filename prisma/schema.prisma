@@ -12,10 +12,17 @@ datasource db {
 enum DealStatus {
   CREATED
   JOINED
+  // Legacy state (custodial era) — kept for historical rows and the legacy
+  // ledger tests. New deals never enter it.
   AWAITING_FUNDING
+  // Manual-payment flow states.
+  AWAITING_PAYMENT
+  PAYMENT_REPORTED
   FUNDED
   IN_PROGRESS
   DELIVERED
+  RELEASE_REQUESTED
+  // Legacy state (custodial era) — kept for historical rows + ledger tests.
   RELEASE_PENDING
   COMPLETED
   DISPUTED
@@ -36,6 +43,32 @@ enum DealCategory {
   PHYSICAL_GOODS
   GIFT_CARDS
   OTHER_LAWFUL
+}
+
+enum PaymentMethod {
+  INR
+  CRYPTO
+}
+
+enum PaymentReportStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum EscrowAuditAction {
+  PAYMENT_REPORTED
+  PAYMENT_VERIFIED
+  PAYMENT_REJECTED
+  EVIDENCE_REQUESTED
+  EVIDENCE_SUBMITTED
+  RELEASE_REQUESTED
+  MANUAL_RELEASE_CONFIRMED
+  REFUND_REQUESTED
+  MANUAL_REFUND_CONFIRMED
+  FEE_RECORDED
+  DELIVERY_MARKED
+  DISPUTE_OPENED
 }
 
 enum TransactionType {
@@ -130,6 +163,9 @@ model User {
   withdrawalRequests  WithdrawalRequest[]
   blockchainDeposits  BlockchainDeposit[]
   depositAddresses    DepositAddress[]
+  paymentReports      PaymentReport[] @relation("PaymentReporter")
+  verifiedPayments    PaymentReport[] @relation("PaymentVerifier")
+  escrowAuditLogs     EscrowAuditLog[]
 
   @@map("users")
 }
@@ -158,13 +194,34 @@ model Deal {
   inviteCode           String        @unique @map("invite_code") @db.VarChar(12)
   buyerId              String        @map("buyer_id") @db.Uuid
   sellerId             String?       @map("seller_id") @db.Uuid
-  asset                String        @db.VarChar(10)
-  network              String        @db.VarChar(20)
+  asset                String        @db.VarChar(10) // USDT / INR / BTC ... payment denomination
+  network              String        @db.VarChar(20) // TRC20 / BEP20 / UPI ... denomination
   amount               Decimal       @db.Decimal(18, 8)
   buyerFeeBps          Int           @default(100) @map("buyer_fee_bps") // basis points, e.g. 100 = 1%
   sellerFeeBps         Int           @default(100) @map("seller_fee_bps")
-  buyerFeeAmount       Decimal       @default(0) @map("buyer_fee_amount") @db.Decimal(18, 8) // fee collected at funding
-  sellerFeeAmount      Decimal       @default(0) @map("seller_fee_amount") @db.Decimal(18, 8) // fee collected at release
+  buyerFeeAmount       Decimal       @default(0) @map("buyer_fee_amount") @db.Decimal(18, 8) // fee recorded at payment verification
+  sellerFeeAmount      Decimal       @default(0) @map("seller_fee_amount") @db.Decimal(18, 8) // fee recorded at release
+  // ── Manual payment verification (escrower-verified, no custody) ──
+  paymentMethod        PaymentMethod @default(CRYPTO) @map("payment_method")
+  currency             String?       @db.VarChar(10) // INR or asset symbol (USDT, BTC...)
+  paymentReference     String?       @map("payment_reference") @db.VarChar(256)
+  paymentReportedAt    DateTime?     @map("payment_reported_at") @db.Timestamptz()
+  paymentReportedBy    String?       @map("payment_reported_by") @db.Uuid
+  paymentVerifiedAt    DateTime?     @map("payment_verified_at") @db.Timestamptz()
+  paymentVerifiedBy    String?       @map("payment_verified_by") @db.Uuid
+  paymentEvidence      String?       @map("payment_evidence") @db.Text
+  paymentNotes         String?       @map("payment_notes") @db.Text
+  releaseRequestedAt   DateTime?     @map("release_requested_at") @db.Timestamptz()
+  releasedAt           DateTime?     @map("released_at") @db.Timestamptz()
+  releasedBy           String?       @map("released_by") @db.Uuid
+  payoutReference      String?       @map("payout_reference") @db.VarChar(256)
+  payoutMethod         String?       @map("payout_method") @db.VarChar(20)
+  sellerPayoutAmount   Decimal?      @map("seller_payout_amount") @db.Decimal(18, 8)
+  escrowFeeAmount      Decimal?      @map("escrow_fee_amount") @db.Decimal(18, 8) // buyer fee + seller fee
+  refundRequestedAt    DateTime?     @map("refund_requested_at") @db.Timestamptz()
+  refundedAt           DateTime?     @map("refunded_at") @db.Timestamptz()
+  refundedBy           String?       @map("refunded_by") @db.Uuid
+  refundReference      String?       @map("refund_reference") @db.VarChar(256)
   description          String        @db.Text
   category             DealCategory
   status               DealStatus
@@ -179,6 +236,8 @@ model Deal {
   ledgerEntries LedgerEntry[]
   dispute       Dispute?
   adminActions  AdminAction[]
+  paymentReports PaymentReport[]
+  auditLogs      EscrowAuditLog[]
 
   @@index([buyerId, status])
   @@index([sellerId, status])
@@ -336,6 +395,61 @@ model WithdrawalRequest {
   @@index([userId, status])
   @@index([status, createdAt])
   @@map("withdrawal_requests")
+}
+
+// ─── Payment Reports (manual escrower-verified payments) ────────────────
+// A buyer reports that they paid the escrower manually (outside the bot).
+// The escrower/admin then verifies or rejects the report. The bot NEVER
+// credits, monitors or moves funds — this is an audit record only.
+
+model PaymentReport {
+  id              String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  dealId          String            @map("deal_id") @db.Uuid
+  reportedBy      String            @map("reported_by") @db.Uuid
+  paymentMethod   PaymentMethod     @map("payment_method")
+  amount          Decimal           @db.Decimal(18, 8)
+  reference       String?           @db.VarChar(256)
+  evidence        String?           @db.Text
+  notes           String?           @db.Text
+  status          PaymentReportStatus @default(PENDING)
+  verifiedBy      String?           @map("verified_by") @db.Uuid
+  verifiedAt      DateTime?         @map("verified_at") @db.Timestamptz()
+  rejectedAt      DateTime?         @map("rejected_at") @db.Timestamptz()
+  rejectionReason String?           @map("rejection_reason") @db.Text
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz()
+
+  deal     Deal? @relation(fields: [dealId], references: [id])
+  reporter User? @relation("PaymentReporter", fields: [reportedBy], references: [id])
+  verifier User? @relation("PaymentVerifier", fields: [verifiedBy], references: [id])
+
+  @@index([dealId, createdAt])
+  @@index([status])
+  @@map("payment_reports")
+}
+
+// ─── Escrow Audit Log (manual financial events) ─────────────────────────
+// Append-only record of every manual escrow financial event. The bot has no
+// custody of funds, so these entries replace ledger mutations for the manual
+// workflow. Every event identifies deal, actor, amount, currency, reference.
+
+model EscrowAuditLog {
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  dealId        String           @map("deal_id") @db.Uuid
+  action        EscrowAuditAction
+  userId        String?          @map("user_id") @db.Uuid
+  actorUsername String?          @map("actor_username") @db.VarChar(64)
+  amount        Decimal?         @db.Decimal(18, 8)
+  currency      String?          @db.VarChar(10)
+  reference     String?          @db.VarChar(256)
+  notes         String?          @db.Text
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz()
+
+  deal Deal? @relation(fields: [dealId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([dealId, createdAt])
+  @@index([action])
+  @@map("escrow_audit_logs")
 }
 
 // ─── Disputes ─────────────────────────────────────────────────────────────

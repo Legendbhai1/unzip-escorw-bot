@@ -1,9 +1,12 @@
 import { prisma, Prisma } from "../lib/db.js";
 import { logger } from "../lib/logger.js";
-import { canTransition, DISPUTABLE_STATES, TERMINAL_STATES, EXPIRABLE_STATES } from "../lib/stateMachine.js";
-import { treasuryService, HOUSE_USER_ID } from "./treasuryService.js";
+import { canTransition, DISPUTABLE_STATES, TERMINAL_STATES, EXPIRABLE_STATES, ACTIVE_STATES } from "../lib/stateMachine.js";
+// Legacy custodial ledger helpers (used by fund/release/resolveDispute below,
+// which are kept ONLY for historical rows and the ledger test suite. The
+// manual escrow workflow never calls them — the bot has no custody of funds).
+import { HOUSE_USER_ID } from "./treasuryService.js";
 import { config } from "../config/index.js";
-import type { DealStatus, DealCategory } from "@prisma/client";
+import type { DealStatus, DealCategory, PaymentMethod } from "@prisma/client";
 import { randomUUID } from "node:crypto";
 
 function generateInviteCode(): string {
@@ -30,6 +33,8 @@ export const dealService = {
     amount: string;
     asset: string;
     network: string;
+    paymentMethod: "INR" | "CRYPTO";
+    currency?: string;
     description: string;
     category: DealCategory;
   }) {
@@ -41,6 +46,8 @@ export const dealService = {
         asset: input.asset,
         network: input.network,
         amount: input.amount,
+        paymentMethod: input.paymentMethod as PaymentMethod,
+        currency: input.currency ?? input.asset,
         buyerFeeBps: config.buyerFeeBps,
         sellerFeeBps: config.sellerFeeBps,
         description: input.description,
@@ -67,17 +74,399 @@ export const dealService = {
       data: { sellerId: sellerUserId, status: "JOINED" },
     });
 
-    // Auto-advance to AWAITING_FUNDING
+    // Both parties have joined -> the buyer pays the escrower MANUALLY and the
+    // escrower verifies. The bot never holds funds, so there is no funding
+    // step: we move straight to AWAITING_PAYMENT.
     const expiryMs = config.dealFundingExpiryMs;
     await prisma.deal.update({
       where: { id: dealId },
       data: {
-        status: "AWAITING_FUNDING",
+        status: "AWAITING_PAYMENT",
         expiresAt: new Date(Date.now() + expiryMs),
       },
     });
 
-    logger.info({ dealId, sellerUserId }, "Deal joined -> AWAITING_FUNDING");
+    logger.info({ dealId, sellerUserId }, "Deal joined -> AWAITING_PAYMENT (manual verification)");
+  },
+
+  // ── Manual Payment Workflow (escrower-verified, no custody) ────
+
+  /**
+   * Lock a deal row FOR UPDATE inside a transaction.
+   */
+  async _lockDeal(tx: Prisma.TransactionClient, dealId: string) {
+    const rows = await tx.$queryRaw<Array<any>>(
+      Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, network,
+        currency, payment_method, buyer_fee_bps, seller_fee_bps, buyer_fee_amount
+        FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
+    );
+    if (!rows[0]) throw new Error("Deal not found");
+    return rows[0];
+  },
+
+  /**
+   * Buyer reports that they paid the escrower manually ("I've Paid").
+   * Creates a PENDING PaymentReport + audit record. Deal -> PAYMENT_REPORTED.
+   * This NEVER marks the deal funded — only the escrower's manual
+   * verification (verifyPayment) can do that.
+   */
+  async reportPayment(
+    dealId: string,
+    buyerUserId: string,
+    opts: { reference?: string; evidence?: string; notes?: string } = {}
+  ) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.buyer_id !== buyerUserId) throw new Error("Only the buyer can report payment");
+      const t = canTransition(d.status, "PAYMENT_REPORTED", "BUYER");
+      if (!t) throw new Error(`Cannot report payment from ${d.status}`);
+
+      const report = await tx.paymentReport.create({
+        data: {
+          dealId,
+          reportedBy: buyerUserId,
+          paymentMethod: d.payment_method as PaymentMethod,
+          amount: d.amount,
+          reference: opts.reference ?? null,
+          evidence: opts.evidence ?? null,
+          notes: opts.notes ?? null,
+          status: "PENDING",
+        },
+      });
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "PAYMENT_REPORTED",
+          paymentReportedAt: new Date(),
+          paymentReportedBy: buyerUserId,
+          ...(opts.reference ? { paymentReference: opts.reference } : {}),
+          ...(opts.evidence ? { paymentEvidence: opts.evidence } : {}),
+          ...(opts.notes ? { paymentNotes: opts.notes } : {}),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "PAYMENT_REPORTED", userId: buyerUserId,
+          amount: d.amount, currency: d.currency ?? d.asset,
+          reference: opts.reference ?? null, notes: opts.notes ?? null,
+        },
+      });
+
+      logger.info({ dealId, buyerUserId }, "Payment reported (awaiting escrower verification)");
+      return report;
+    });
+  },
+
+  /**
+   * Escrower/admin rejects the payment report. Deal -> AWAITING_PAYMENT so the
+   * buyer can re-report. The report stays as a REJECTED audit record.
+   */
+  async rejectPayment(dealId: string, adminUserId: string, reason: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      const t = canTransition(d.status, "AWAITING_PAYMENT", "ADMIN");
+      if (!t) throw new Error(`Cannot reject payment from ${d.status}`);
+
+      const report = await tx.paymentReport.findFirst({
+        where: { dealId, status: "PENDING" },
+        orderBy: { createdAt: "desc" },
+      });
+      if (report) {
+        await tx.paymentReport.update({
+          where: { id: report.id },
+          data: { status: "REJECTED", rejectedAt: new Date(), rejectionReason: reason },
+        });
+      }
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: { status: "AWAITING_PAYMENT", paymentVerifiedAt: null, paymentVerifiedBy: null },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: { dealId, action: "PAYMENT_REJECTED", userId: adminUserId, notes: reason },
+      });
+
+      logger.warn({ dealId, adminUserId, reason }, "Payment report rejected");
+    });
+  },
+
+  /**
+   * Escrower/admin MANUALLY verifies the payment OUTSIDE the bot and marks the
+   * deal FUNDED. This is the ONLY way a deal becomes FUNDED — the bot never
+   * infers payment from blockchain events, screenshots, "I paid" or hashes.
+   * Fees are computed and recorded as FEE_RECORDED audit entries; no balance
+   * or ledger mutation happens (the bot has no custody).
+   */
+  async verifyPayment(dealId: string, adminUserId: string, reference?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      const t = canTransition(d.status, "FUNDED", "ADMIN");
+      if (!t) throw new Error(`Cannot verify payment from ${d.status} (deal must be PAYMENT_REPORTED)`);
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const buyerFee = dealAmount.mul(new Prisma.Decimal(d.buyer_fee_bps)).div(new Prisma.Decimal(10000));
+      const totalPaid = dealAmount.add(buyerFee);
+
+      const report = await tx.paymentReport.findFirst({
+        where: { dealId, status: "PENDING" },
+        orderBy: { createdAt: "desc" },
+      });
+      if (report) {
+        await tx.paymentReport.update({
+          where: { id: report.id },
+          data: { status: "VERIFIED", verifiedBy: adminUserId, verifiedAt: new Date() },
+        });
+      }
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "FUNDED",
+          buyerFeeAmount: buyerFee,
+          paymentVerifiedAt: new Date(),
+          paymentVerifiedBy: adminUserId,
+          ...(reference ? { paymentReference: reference } : {}),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "PAYMENT_VERIFIED", userId: adminUserId,
+          amount: dealAmount, currency: d.currency ?? d.asset,
+          reference: reference ?? null, notes: "Escrower manually verified payment outside the bot",
+        },
+      });
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "FEE_RECORDED", userId: d.buyer_id,
+          amount: buyerFee, currency: d.currency ?? d.asset,
+          notes: `Buyer fee ${d.buyer_fee_bps} bps (${buyerFee.toString()})`,
+        },
+      });
+
+      // Internal payment-history record only (no custody, no balance change).
+      await tx.transaction.create({
+        data: {
+          userId: d.buyer_id, type: "ESCROW_LOCK", asset: d.asset,
+          amount: totalPaid.toString(), status: "CONFIRMED", dealId,
+        },
+      });
+
+      logger.info({ dealId, adminUserId, buyerFee: buyerFee.toString() }, "Payment manually verified -> FUNDED");
+      return { dealId, buyerFee: buyerFee.toString(), totalPaid: totalPaid.toString() };
+    });
+  },
+
+  /**
+   * Buyer accepts delivery -> RELEASE_REQUESTED. The escrower then pays the
+   * seller manually and confirms the release (confirmManualRelease).
+   */
+  async requestRelease(dealId: string, buyerUserId: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.buyer_id !== buyerUserId) throw new Error("Only the buyer can accept delivery");
+      const t = canTransition(d.status, "RELEASE_REQUESTED", "BUYER");
+      if (!t) throw new Error(`Cannot request release from ${d.status}`);
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: { status: "RELEASE_REQUESTED", releaseRequestedAt: new Date() },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "RELEASE_REQUESTED", userId: buyerUserId,
+          amount: d.amount, currency: d.currency ?? d.asset,
+          notes: "Buyer accepted delivery; escrower must pay seller manually",
+        },
+      });
+
+      logger.info({ dealId, buyerUserId }, "Release requested (awaiting manual escrower payout)");
+    });
+  },
+
+  /**
+   * Escrower/admin confirms they manually paid the seller OUTSIDE the bot.
+   * Deal -> COMPLETED. Records payout details + FEE_RECORDED. No ledger move.
+   */
+  async confirmManualRelease(dealId: string, adminUserId: string, reference?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      const t = canTransition(d.status, "COMPLETED", "ADMIN");
+      if (!t) throw new Error(`Cannot mark released from ${d.status} (deal must be RELEASE_REQUESTED)`);
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const sellerFee = dealAmount.mul(new Prisma.Decimal(d.seller_fee_bps)).div(new Prisma.Decimal(10000));
+      const sellerPayout = dealAmount.sub(sellerFee);
+      const buyerFee = new Prisma.Decimal(d.buyer_fee_amount ?? "0");
+      const escrowFee = buyerFee.add(sellerFee);
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "COMPLETED",
+          completedAt: new Date(),
+          releasedAt: new Date(),
+          releasedBy: adminUserId,
+          sellerFeeAmount: sellerFee,
+          sellerPayoutAmount: sellerPayout,
+          escrowFeeAmount: escrowFee,
+          payoutMethod: d.payment_method as string,
+          ...(reference ? { payoutReference: reference } : {}),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "MANUAL_RELEASE_CONFIRMED", userId: adminUserId,
+          amount: sellerPayout, currency: d.currency ?? d.asset,
+          reference: reference ?? null,
+          notes: "Escrower manually paid the seller outside the bot",
+        },
+      });
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "FEE_RECORDED", userId: d.seller_id ?? undefined,
+          amount: sellerFee, currency: d.currency ?? d.asset,
+          notes: `Seller fee ${d.seller_fee_bps} bps (${sellerFee.toString()})`,
+        },
+      });
+
+      if (d.seller_id) {
+        await tx.transaction.create({
+          data: {
+            userId: d.seller_id, type: "ESCROW_RELEASE", asset: d.asset,
+            amount: sellerPayout.toString(), status: "CONFIRMED", dealId,
+          },
+        });
+      }
+
+      logger.info({ dealId, adminUserId, sellerPayout: sellerPayout.toString() }, "Manual release confirmed -> COMPLETED");
+      return { dealId, sellerPayout: sellerPayout.toString(), sellerFee: sellerFee.toString(), escrowFee: escrowFee.toString() };
+    });
+  },
+
+  /**
+   * Admin resolves a dispute with a MANUAL REFUND (escrower refunds the buyer
+   * outside the bot). Deal -> REFUNDED. Audit + history records only.
+   */
+  async manualRefund(dealId: string, adminUserId: string, reason: string, reference?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      const t = canTransition(d.status, "REFUNDED", "ADMIN");
+      if (!t) throw new Error(`Cannot refund from ${d.status} (deal must be UNDER_REVIEW)`);
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "REFUNDED",
+          completedAt: new Date(),
+          refundedAt: new Date(),
+          refundedBy: adminUserId,
+          ...(reference ? { refundReference: reference } : {}),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "MANUAL_REFUND_CONFIRMED", userId: adminUserId,
+          amount: d.amount, currency: d.currency ?? d.asset,
+          reference: reference ?? null, notes: reason,
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          userId: d.buyer_id, type: "REFUND", asset: d.asset,
+          amount: d.amount.toString(), status: "CONFIRMED", dealId,
+        },
+      });
+
+      const dispute = await tx.dispute.findUnique({ where: { dealId } });
+      if (dispute) {
+        await tx.dispute.update({
+          where: { id: dispute.id },
+          data: { status: "RESOLVED", resolution: "REFUND_BUYER", assignedAdmin: adminUserId, resolvedAt: new Date() },
+        });
+      }
+      await tx.adminAction.create({
+        data: { adminId: adminUserId, actionType: "DISPUTE_RESOLVE_REFUND", dealId, reason },
+      });
+
+      logger.info({ dealId, adminUserId }, "Manual refund confirmed -> REFUNDED");
+    });
+  },
+
+  /**
+   * Admin resolves a dispute with a MANUAL RELEASE (escrower paid the seller
+   * outside the bot). Deal -> RELEASED. Audit + history records only.
+   */
+  async manualReleaseForDispute(dealId: string, adminUserId: string, reason: string, reference?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      const t = canTransition(d.status, "RELEASED", "ADMIN");
+      if (!t) throw new Error(`Cannot release from ${d.status} (deal must be UNDER_REVIEW)`);
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const sellerFee = dealAmount.mul(new Prisma.Decimal(d.seller_fee_bps)).div(new Prisma.Decimal(10000));
+      const sellerPayout = dealAmount.sub(sellerFee);
+      const buyerFee = new Prisma.Decimal(d.buyer_fee_amount ?? "0");
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "RELEASED",
+          completedAt: new Date(),
+          releasedAt: new Date(),
+          releasedBy: adminUserId,
+          sellerFeeAmount: sellerFee,
+          sellerPayoutAmount: sellerPayout,
+          escrowFeeAmount: buyerFee.add(sellerFee),
+          payoutMethod: d.payment_method as string,
+          ...(reference ? { payoutReference: reference } : {}),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "MANUAL_RELEASE_CONFIRMED", userId: adminUserId,
+          amount: sellerPayout, currency: d.currency ?? d.asset,
+          reference: reference ?? null, notes: reason,
+        },
+      });
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "FEE_RECORDED", userId: d.seller_id ?? undefined,
+          amount: sellerFee, currency: d.currency ?? d.asset,
+          notes: `Seller fee ${d.seller_fee_bps} bps (${sellerFee.toString()})`,
+        },
+      });
+
+      if (d.seller_id) {
+        await tx.transaction.create({
+          data: {
+            userId: d.seller_id, type: "ESCROW_RELEASE", asset: d.asset,
+            amount: sellerPayout.toString(), status: "CONFIRMED", dealId,
+          },
+        });
+      }
+
+      const dispute = await tx.dispute.findUnique({ where: { dealId } });
+      if (dispute) {
+        await tx.dispute.update({
+          where: { id: dispute.id },
+          data: { status: "RESOLVED", resolution: "RELEASE_TO_SELLER", assignedAdmin: adminUserId, resolvedAt: new Date() },
+        });
+      }
+      await tx.adminAction.create({
+        data: { adminId: adminUserId, actionType: "DISPUTE_RESOLVE_RELEASE", dealId, reason },
+      });
+
+      logger.info({ dealId, adminUserId }, "Manual dispute release confirmed -> RELEASED");
+    });
   },
 
   // ── Transition State (central gate, row-locked) ────────────────
@@ -760,7 +1149,7 @@ export const dealService = {
     const now = new Date();
     const expiredDeals = await prisma.deal.findMany({
       where: {
-        status: { in: ["CREATED", "AWAITING_FUNDING"] },
+        status: { in: ["CREATED", "JOINED", "AWAITING_PAYMENT", "AWAITING_FUNDING"] },
         expiresAt: { lt: now },
       },
     });
@@ -796,7 +1185,7 @@ export const dealService = {
     return prisma.deal.findMany({
       where: {
         OR: [{ buyerId: userId }, { sellerId: userId }],
-        status: { in: ["CREATED", "JOINED", "AWAITING_FUNDING", "FUNDED", "IN_PROGRESS", "DELIVERED", "RELEASE_PENDING", "DISPUTED", "UNDER_REVIEW"] },
+        status: { in: [...ACTIVE_STATES] },
       },
       include: { buyer: true, seller: true },
       orderBy: { createdAt: "desc" },

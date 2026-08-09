@@ -24,6 +24,8 @@ const USER_C = "cccccccc-cccc-cccc-cccc-cccccccccccc"; // reserved for mnemonic-
 async function cleanAll() {
   await prisma.depositAddress.deleteMany();
   await prisma.blockchainDeposit.deleteMany();
+  await prisma.escrowAuditLog.deleteMany();
+  await prisma.paymentReport.deleteMany();
   await prisma.ledgerEntry.deleteMany();
   await prisma.ledgerTransaction.deleteMany();
   await prisma.transaction.deleteMany();

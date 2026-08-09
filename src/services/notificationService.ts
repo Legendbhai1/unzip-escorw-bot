@@ -1,6 +1,7 @@
 import { prisma } from "../lib/db.js";
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
+import { config } from "../config/index.js";
 
 // Lazy import to avoid circular dependency with bot/index.ts
 let _bot: any = null;
@@ -26,7 +27,8 @@ export const notificationService = {
     inviteCode: string,
     amount: string,
     asset: string,
-    description: string
+    description: string,
+    paymentLabel?: string
   ) {
     try {
       const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -35,17 +37,39 @@ export const notificationService = {
       const b = await getBot();
       const botInfo = await b.api.getMe();
       const link = `https://t.me/${botInfo.username}?start=deal_${inviteCode}`;
+      const amountStr = asset === "INR" ? `${amount} INR` : `${amount} ${asset}`;
 
       await b.api.sendMessage(Number(user.telegramId),
         `<b>NEW ESCROW DEAL</b>\n\n` +
         `A deal has been created involving you:\n\n` +
-        `Amount: <b>${esc(amount)} ${esc(asset)}</b>\n` +
+        `Payment: <b>${esc(paymentLabel ?? (asset === "INR" ? "INR / UPI" : "Crypto"))}</b>\n` +
+        `Amount: <b>${esc(amountStr)}</b>\n` +
         `Item: ${esc(description.slice(0, 100))}\n\n` +
+        `🔐 Payment is manually verified by the escrower.\n\n` +
         `Tap below to review and accept:\n${esc(link)}`,
         { parse_mode: "HTML" }
       );
     } catch (e) {
       logger.warn({ userId, err: e }, "Failed to send deal created notification");
+    }
+  },
+
+  /**
+   * Send a message (optionally with an inline keyboard) to every configured
+   * admin/escrower. Used for payment reports, release requests and disputes.
+   */
+  async notifyAdmins(message: string, replyMarkup?: unknown) {
+    const b = await getBot();
+    const ids = [...config.adminTelegramIds];
+    for (const tid of ids) {
+      try {
+        await b.api.sendMessage(tid, message, {
+          parse_mode: "HTML",
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+      } catch (e) {
+        logger.warn({ tid, err: e }, "Failed to notify admin");
+      }
     }
   },
 

@@ -80,11 +80,28 @@ export const config = {
   sellerFeeChargedOnRefund: boolEnv("SELLER_FEE_CHARGED_ON_REFUND", false),
 
   // ── Deal Expiration ─────────────────────────────────────────────
-  // Deals in AWAITING_FUNDING expire after this many ms (default 24h)
+  // Deals in AWAITING_PAYMENT expire after this many ms (default 24h)
   dealFundingExpiryMs: intEnv("DEAL_FUNDING_EXPIRY_MS", 86_400_000),
 
   // Deals in FUNDED expire after this many ms if no progress (default 7d)
   dealFundedExpiryMs: intEnv("DEAL_FUNDED_EXPIRY_MS", 604_800_000),
+
+  // ── Escrower manual payment instructions ────────────────────────
+  // The escrower personally verifies incoming payment and pays the seller.
+  // These are the escrower's own payment details — NEVER auto-generated.
+  // If unset, users see "Payment instructions are currently unavailable."
+  escrow: {
+    upiId: process.env.ESCROW_UPI_ID ?? "",
+    upiName: process.env.ESCROW_UPI_NAME ?? "",
+    cryptoAddresses: {
+      "USDT_TRC20": process.env.ESCROW_CRYPTO_ADDRESS_USDT_TRC20 ?? "",
+      "USDT_BEP20": process.env.ESCROW_CRYPTO_ADDRESS_USDT_BEP20 ?? "",
+    } as Record<string, string>,
+  },
+
+  // Escrow group chat id the deal form card is posted to (optional).
+  // When empty, the card is not posted anywhere (form still completes).
+  escrowGroupId: process.env.ESCROW_GROUP_ID ?? "",
 } as const;
 
 export function isAdmin(telegramId: number): boolean {

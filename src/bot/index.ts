@@ -1,15 +1,16 @@
 import { Bot, InlineKeyboard, session } from "grammy";
-import { DealCategory } from "@prisma/client";
 import { config } from "../config/index.js";
 import { redis } from "../lib/redis.js";
 import { userService } from "../services/userService.js";
 import { dealService } from "../services/dealService.js";
-import { blockchainMonitor } from "../services/blockchainMonitor.js";
-import { mainMenu, roleSelect, assetSelect, categorySelect, dealConfirm, acceptRejectDeal, backToMain, walletMenu, dealTabs, dealActions } from "./keyboards/index.js";
-import { handleJoinDeal, handleAcceptDeal, showDealStatus } from "./scenes/joinDeal.js";
-import { handleRelease, handleReleaseConfirm, handleDeliver, handleDispute, handleDisputeReason } from "./scenes/depositDeliveryRelease.js";
-import { showWallet, showDeposit, showMyDeals } from "./scenes/walletAndDeals.js";
 import { notificationService } from "../services/notificationService.js";
+import { mainMenu, backToMain, dealTabs } from "./keyboards/index.js";
+import { handleJoinDeal, handleAcceptDeal, showDealStatus } from "./scenes/joinDeal.js";
+import { handleAcceptRelease, handleDeliver, handleDispute, handleDisputeReason } from "./scenes/depositDeliveryRelease.js";
+import { showHistory, showMyDeals } from "./scenes/walletAndDeals.js";
+import {
+  startDealForm, processDealFormCallback, processDealFormText,
+} from "./scenes/dealForm.js";
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
 import type { MyContext, SessionData } from "./context.js";
@@ -33,7 +34,7 @@ bot.api.config.use((prev, method, payload, signal) => {
   return prev(method, payload, signal);
 });
 
-// ─── Session Middleware (Redis-backed) ─────────────────────────────────
+// ─── Session Middleware (Redis-backed with in-memory fallback) ─────────
 bot.use(session({
   initial: (): SessionData => ({
     userId: "", telegramId: 0, username: null, firstName: "",
@@ -86,18 +87,48 @@ bot.command("start", async (ctx) => {
     await handleJoinDeal(ctx, arg.slice(5));
     return;
   }
+  if (arg?.startsWith("cancel_")) {
+    const inviteCode = arg.slice(7);
+    const deal = await dealService.findByInviteCode(inviteCode);
+    if (!deal) {
+      await ctx.reply("Deal not found or expired.", { reply_markup: backToMain });
+      return;
+    }
+    const userId = ctx.session.userId;
+    if (deal.buyerId !== userId && deal.sellerId !== userId) {
+      await ctx.reply("Only a party to this deal can cancel it.", { reply_markup: backToMain });
+      return;
+    }
+    try {
+      await dealService.cancel(deal.id, userId);
+      await ctx.reply(`Deal #${esc(deal.inviteCode)} cancelled.`, { reply_markup: backToMain });
+    } catch (e: unknown) {
+      await ctx.reply(esc(e instanceof Error ? e.message : "Cannot cancel this deal"), { reply_markup: backToMain });
+    }
+    return;
+  }
 
   await ctx.reply(
-    "<b>ESCROW</b>\n\nSecure your trades with our escrow system.\n\nCreate a deal and let us protect the transaction.",
+    "<b>ESCROW</b>\n\nSecure your trades with a manually-verified escrow.\n\n" +
+    "The escrower personally verifies payment and pays the seller — the bot never holds your funds.\n\n" +
+    "Create a deal and let us protect the transaction.",
     { reply_markup: mainMenu }
   );
+});
+
+// ─── /form Command + "form" text (same canonical flow as the button) ──
+bot.command("form", async (ctx) => {
+  await startDealForm(ctx);
+});
+bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
+  await startDealForm(ctx);
 });
 
 // ─── Callback Query Router ─────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
 
-  // Let admin callbacks be handled first
+  // Admin callbacks first (server-side authorized inside handleAdminCallback)
   if (data.startsWith("admin:")) {
     await handleAdminCallback(ctx);
     return;
@@ -105,35 +136,24 @@ bot.on("callback_query:data", async (ctx) => {
 
   // ── Main Menu ──
   if (data === "menu:main") {
-    // Leaving the create-deal flow: drop any in-progress step so a later
-    // text message is not silently consumed by the abandoned flow.
     ctx.session.createDealStep = undefined;
     await ctx.editMessageText(
-      "<b>ESCROW</b>\n\nSecure your trades with our escrow system.",
+      "<b>ESCROW</b>\n\nSecure your trades with a manually-verified escrow.",
       { reply_markup: mainMenu }
     );
     return;
   }
 
-  // ── Create Deal ──
+  // ── Create Deal (canonical form flow) ──
   if (data === "menu:create_deal") {
-    await ctx.editMessageText(
-      "<b>CREATE DEAL</b>\n\nChoose your role:",
-      { reply_markup: roleSelect }
-    );
-    ctx.session.createDealStep = "role";
+    await startDealForm(ctx);
     return;
   }
 
-  // ── Role selection ──
-  if (data === "role:buyer" || data === "role:seller") {
-    const role = data === "role:buyer" ? "buyer" : "seller";
-    ctx.session.createDealRole = role;
-    await ctx.editMessageText(
-      `You are the <b>${role === "buyer" ? "Buyer" : "Seller"}</b>.\n\nEnter the other party's Telegram username:\n\n<i>Example: @username</i>`,
-      { reply_markup: backToMain }
-    );
-    ctx.session.createDealStep = "counterparty";
+  // ── Deal form callbacks ──
+  if (data.startsWith("form:")) {
+    const handled = await processDealFormCallback(ctx, data);
+    if (handled) await ctx.answerCallbackQuery().catch(() => {});
     return;
   }
 
@@ -149,51 +169,9 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // ── Wallet ──
-  if (data === "menu:wallet") {
-    await showWallet(ctx);
-    return;
-  }
-  if (data === "wallet:deposit") {
-    ctx.session.depositNetwork = "TRC20";
-    await ctx.answerCallbackQuery();
-    try {
-      await showDeposit(ctx);
-    } catch (e: unknown) {
-      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
-    }
-    return;
-  }
-  if (data === "wallet:deposit_trc20") {
-    ctx.session.depositNetwork = "TRC20";
-    await ctx.answerCallbackQuery();
-    try {
-      await showDeposit(ctx);
-    } catch (e: unknown) {
-      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
-    }
-    return;
-  }
-  if (data === "wallet:deposit_bep20") {
-    ctx.session.depositNetwork = "BEP20";
-    await ctx.answerCallbackQuery();
-    try {
-      await showDeposit(ctx);
-    } catch (e: unknown) {
-      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
-    }
-    return;
-  }
-  if (data === "wallet:withdraw") {
-    await ctx.reply("<b>WITHDRAW</b>\n\nWithdrawals are processed via the withdrawal queue.\nContact support for withdrawals.", { reply_markup: walletMenu });
-    return;
-  }
-  if (data === "wallet:transactions") {
-    await ctx.reply("<b>TRANSACTIONS</b>\n\nTransaction history coming soon.", { reply_markup: walletMenu });
-    return;
-  }
-  if (data === "wallet:back") {
-    await showWallet(ctx);
+  // ── Transactions / Payment History (no deposit, no wallet balances) ──
+  if (data === "menu:history") {
+    await showHistory(ctx);
     return;
   }
 
@@ -201,14 +179,17 @@ bot.on("callback_query:data", async (ctx) => {
   if (data === "menu:how_it_works") {
     await ctx.editMessageText(
       "<b>HOW IT WORKS</b>\n\n" +
-      "1. Create a deal and invite the other party\n" +
-      "2. Both parties agree to the terms\n" +
-      "3. Buyer deposits funds to their wallet\n" +
-      "4. Buyer funds the escrow from wallet balance\n" +
-      "5. Seller delivers the item/service\n" +
-      "6. Buyer confirms and releases the funds\n" +
-      "7. Seller receives the payment\n\n" +
-      "If anything goes wrong, either party can open a dispute.",
+      "1. Create a deal (button, /form or the word \"form\")\n" +
+      "2. Both parties join and agree to the terms\n" +
+      "3. You get the escrower's payment instructions\n" +
+      "4. Buyer pays the escrower directly (UPI or crypto)\n" +
+      "5. Buyer taps \"I've Paid\"\n" +
+      "6. The escrower personally verifies the payment\n" +
+      "7. Seller delivers the item/service\n" +
+      "8. Buyer accepts; the escrower manually pays the seller\n" +
+      "9. Deal is marked completed\n\n" +
+      "If anything goes wrong, either party can open a dispute.\n\n" +
+      "🔐 The bot never holds, sends or withdraws funds.",
       { reply_markup: backToMain }
     );
     return;
@@ -220,7 +201,7 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // ── Deal: Accept ──
+  // ── Deal: Accept / Reject ──
   if (data === "deal:accept") {
     await handleAcceptDeal(ctx);
     return;
@@ -237,15 +218,46 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // ── Deal: Release ──
-  if (data.startsWith("deal:release:")) {
+  // ── Deal: Buyer reports "I've Paid" (manual payment) ──
+  if (data.startsWith("deal:paid:")) {
     const dealId = data.split(":")[2];
-    await handleRelease(ctx, dealId);
+    const deal = await dealService.findWithParties(dealId);
+    if (!deal) {
+      await ctx.answerCallbackQuery("Deal not found.");
+      return;
+    }
+    if (deal.buyerId !== ctx.session.userId) {
+      await ctx.answerCallbackQuery("Only the buyer can report payment.");
+      return;
+    }
+    ctx.session.pendingPaymentReportDealId = dealId;
+    await ctx.answerCallbackQuery("Let's record your payment.");
+    await ctx.reply(
+      `<b>REPORT PAYMENT</b>\n\nDeal #${esc(deal.inviteCode)}\n\n` +
+      `Send the <b>payment reference / transaction ID</b> (optional), or send <code>/skip</code>.\n` +
+      `You may also attach a <b>screenshot</b> as evidence.\n\n` +
+      `Note: this only <i>reports</i> your payment — the escrower verifies it manually.`,
+      { reply_markup: backToMain }
+    );
     return;
   }
-  if (data.startsWith("deal:release_confirm:")) {
+
+  // ── Deal: Buyer submits requested evidence ──
+  if (data.startsWith("deal:evidence:")) {
     const dealId = data.split(":")[2];
-    await handleReleaseConfirm(ctx, dealId);
+    ctx.session.pendingEvidenceDealId = dealId;
+    await ctx.answerCallbackQuery("Send your evidence.");
+    await ctx.reply(
+      "Send a <b>screenshot</b> or describe the payment details as text:",
+      { reply_markup: backToMain }
+    );
+    return;
+  }
+
+  // ── Deal: Accept & Release (requests manual release — no auto payout) ──
+  if (data.startsWith("deal:release:")) {
+    const dealId = data.split(":")[2];
+    await handleAcceptRelease(ctx, dealId);
     return;
   }
 
@@ -281,222 +293,205 @@ bot.on("callback_query:data", async (ctx) => {
     await ctx.answerCallbackQuery("Invite link copied!");
     return;
   }
-
-  // ── Deal: Fund (buyer manually triggers lock from wallet) ──
-  if (data.startsWith("deal:fund:")) {
-    const dealId = data.split(":")[2];
-    try {
-      await dealService.fund(dealId);
-      await ctx.answerCallbackQuery("Deal funded from your wallet!");
-      await showDealStatus(ctx, dealId);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      await ctx.answerCallbackQuery(msg);
-    }
-    return;
-  }
-
-  // ── Asset selection ──
-  if (data?.startsWith("asset:")) {
-    const parts = data.replace("asset:", "").split("_");
-    ctx.session.createDealAsset = parts[0];
-    ctx.session.createDealNetwork = parts[1] ?? parts[0];
-    await ctx.editMessageText(
-      "<b>DEAL DESCRIPTION</b>\n\nDescribe what is being traded:\n\n<i>Example: Logo design for website, 3 revisions included</i>",
-      { reply_markup: backToMain }
-    );
-    ctx.session.createDealStep = "description";
-    await ctx.answerCallbackQuery();
-    return;
-  }
-
-  // ── Category selection ──
-  if (data?.startsWith("cat:")) {
-    ctx.session.createDealCategory = data.replace("cat:", "");
-    const s = ctx.session;
-
-    const buyerFeePct = (config.buyerFeeBps / 100).toFixed(config.buyerFeeBps % 100 === 0 ? 0 : 2);
-    const sellerFeePct = (config.sellerFeeBps / 100).toFixed(config.sellerFeeBps % 100 === 0 ? 0 : 2);
-    const amount = parseFloat(s.createDealAmount ?? "0");
-    const buyerFee = (amount * config.buyerFeeBps / 10000).toFixed(2);
-    const sellerFee = (amount * config.sellerFeeBps / 10000).toFixed(2);
-
-    await ctx.reply(
-      `<b>DEAL SUMMARY</b>\n\n` +
-      `${s.createDealRole === "buyer" ? "Seller" : "Buyer"}: @${esc(s.createDealCounterpartyUsername ?? "")}\n` +
-      `${s.createDealRole === "buyer" ? "Buyer" : "Seller"}: @${esc(s.username ?? s.firstName)}\n\n` +
-      `Amount: ${esc(s.createDealAmount)} ${esc(s.createDealAsset)}\n` +
-      `Buyer fee (${buyerFeePct}%): ${buyerFee} ${esc(s.createDealAsset)}\n` +
-      `Seller fee (${sellerFeePct}%): ${sellerFee} ${esc(s.createDealAsset)}\n` +
-      `Buyer pays total: ${(amount + parseFloat(buyerFee)).toFixed(2)} ${esc(s.createDealAsset)}\n` +
-      `Seller receives: ${(amount - parseFloat(sellerFee)).toFixed(2)} ${esc(s.createDealAsset)}\n\n` +
-      `Item: ${esc(s.createDealDescription)}\n\n` +
-      `Everything correct?`,
-      { reply_markup: dealConfirm() }
-    );
-    ctx.session.createDealStep = "confirm";
-    await ctx.answerCallbackQuery();
-    return;
-  }
-
-  // ── Confirm deal creation ──
-  if (data === "deal:confirm") {
-    const s = ctx.session;
-    try {
-      const buyerId = s.createDealRole === "buyer" ? s.userId : (s.createDealCounterpartyUserId ?? "");
-      const sellerId = s.createDealRole === "seller" ? s.userId : (s.createDealCounterpartyUserId ?? null);
-
-      const deal = await dealService.create({
-        buyerUserId: buyerId,
-        sellerUserId: sellerId,
-        sellerUsername: s.createDealCounterpartyUsername ?? "",
-        amount: s.createDealAmount ?? "0",
-        asset: s.createDealAsset ?? "USDT",
-        network: s.createDealNetwork ?? "TRC20",
-        description: s.createDealDescription ?? "",
-        category: (s.createDealCategory ?? "FREELANCE_SERVICES") as DealCategory,
-      });
-
-      // Notify counterparty if they exist in system
-      if (s.createDealCounterpartyUserId) {
-        await notificationService.notifyDealCreated(
-          s.createDealCounterpartyUserId,
-          deal.inviteCode,
-          s.createDealAmount ?? "0",
-          s.createDealAsset ?? "USDT",
-          s.createDealDescription ?? ""
-        );
-      }
-
-      const botInfo = await ctx.api.getMe();
-      const link = `https://t.me/${botInfo.username}?start=deal_${deal.inviteCode}`;
-
-      await ctx.reply(
-        `<b>DEAL CREATED</b>\n\n` +
-        `Deal ID: <code>#${deal.inviteCode}</code>\n\n` +
-        `Waiting for the ${s.createDealRole === "buyer" ? "seller" : "buyer"} to join.\n\n` +
-        `Invite Link:\n<code>${link}</code>\n\n` +
-        `Do not send funds until both parties have joined.`,
-        {
-          reply_markup: new InlineKeyboard()
-            .text("Copy Deal Link", `deal:copy:${deal.inviteCode}`)
-            .row()
-            .text("Cancel Deal", `deal:cancel:${deal.id}`)
-            .row()
-            .text("Main Menu", "menu:main"),
-        }
-      );
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      await ctx.reply(`Error: ${msg}`, { reply_markup: backToMain });
-    }
-    // Clear draft
-    ctx.session.createDealStep = undefined;
-    ctx.session.createDealRole = undefined;
-    ctx.session.createDealCounterpartyUsername = undefined;
-    ctx.session.createDealCounterpartyUserId = undefined;
-    ctx.session.createDealAmount = undefined;
-    ctx.session.createDealAsset = undefined;
-    ctx.session.createDealNetwork = undefined;
-    ctx.session.createDealDescription = undefined;
-    ctx.session.createDealCategory = undefined;
-    return;
-  }
-
-  if (data === "deal:edit") {
-    await ctx.reply("Starting over.", { reply_markup: mainMenu });
-    ctx.session.createDealStep = undefined;
-    return;
-  }
 });
 
 // ─── Text Message Handler ─────────────────────────────────────────────
 bot.on("message:text", async (ctx, next) => {
-  // Handle dispute reason
-  if (ctx.session.pendingDisputeDealId) {
-    await handleDisputeReason(ctx, ctx.message.text);
-    return;
-  }
-
-  // Handle create-deal steps
-  const step = ctx.session.createDealStep;
-  if (!step) {
-    await next();
-    return;
-  }
-
   const text = ctx.message.text.trim();
 
-  // Counterparty username
-  if (step === "counterparty") {
-    // Normalize: trim, strip leading @ (e.g. "@username" -> "username").
-    const normalized = text.replace(/^@+/, "").trim();
-    // Telegram usernames: 5-32 chars, letters/digits/underscore.
-    const usernameRe = /^[A-Za-z0-9_]{5,32}$/;
-
-    if (!normalized) {
-      await ctx.reply("Please enter the other party's Telegram username, e.g. <code>@username</code>.");
-      return; // stay on the counterparty step
-    }
-    if (!usernameRe.test(normalized)) {
-      await ctx.reply(
-        "That doesn't look like a valid Telegram username.\n\n" +
-        "Usernames are 5–32 characters and may only contain letters, numbers and underscores.\n\n" +
-        "Example: <code>@john_doe</code>\n\nPlease try again:"
-      );
-      return; // stay on the counterparty step
-    }
-
-    const otherUser = await userService.findByUsername(normalized);
-    if (!otherUser) {
-      // Do NOT clear the step: keep the user here so they can retry.
-      await ctx.reply(
-        `User <code>@${esc(normalized)}</code> was not found.\n\n` +
-        `The other person must start this bot first — ask them to send <code>/start</code> to the bot, then enter their username again.`
-      );
-      return;
-    }
-
-    if (otherUser.id === ctx.session.userId) {
-      await ctx.reply("You can't create a deal with yourself. Please enter the other party's username:");
-      return; // stay on the counterparty step
-    }
-
-    ctx.session.createDealCounterpartyUsername = otherUser.username ?? normalized;
-    ctx.session.createDealCounterpartyUserId = otherUser.id;
-    await ctx.reply("<b>DEAL AMOUNT</b>\n\nEnter the amount:\n\n<i>Example: 100</i>", { reply_markup: backToMain });
-    ctx.session.createDealStep = "amount";
+  // 1. Dispute reason
+  if (ctx.session.pendingDisputeDealId) {
+    await handleDisputeReason(ctx, text);
     return;
   }
 
-  // Amount
-  if (step === "amount") {
-    if (!/^[\d.]+$/.test(text) || Number(text) <= 0) {
-      await ctx.reply("Invalid amount. Please enter a positive number.", { reply_markup: backToMain });
-      ctx.session.createDealStep = undefined;
-      return;
+  // 2. Buyer reports payment (reference or notes after "I've Paid")
+  if (ctx.session.pendingPaymentReportDealId) {
+    const dealId = ctx.session.pendingPaymentReportDealId;
+    delete ctx.session.pendingPaymentReportDealId;
+    if (text.toLowerCase() === "/skip") {
+      await completePaymentReport(ctx, dealId, {});
+    } else {
+      await completePaymentReport(ctx, dealId, { reference: text });
     }
-    ctx.session.createDealAmount = text;
-    await ctx.reply("<b>PAYMENT ASSET</b>\n\nChoose the cryptocurrency:", { reply_markup: assetSelect });
-    ctx.session.createDealStep = "asset";
     return;
   }
 
-  // Description (handled after asset callback)
-  if (step === "description") {
-    if (text.length < 5) {
-      await ctx.reply("Description too short.", { reply_markup: backToMain });
-      ctx.session.createDealStep = undefined;
-      return;
-    }
-    ctx.session.createDealDescription = text;
-    await ctx.reply("<b>CATEGORY</b>\n\nSelect the trade category:", { reply_markup: categorySelect });
-    ctx.session.createDealStep = "category";
+  // 3. Buyer submits evidence as text
+  if (ctx.session.pendingEvidenceDealId) {
+    const dealId = ctx.session.pendingEvidenceDealId;
+    delete ctx.session.pendingEvidenceDealId;
+    await submitEvidence(ctx, dealId, text, undefined);
     return;
+  }
+
+  // 4. Admin: rejection reason
+  if (ctx.session.pendingRejectPaymentDealId) {
+    const dealId = ctx.session.pendingRejectPaymentDealId;
+    delete ctx.session.pendingRejectPaymentDealId;
+    try {
+      await dealService.rejectPayment(dealId, ctx.session.userId, text);
+      const deal = await dealService.findWithParties(dealId);
+      await ctx.reply(`Payment report rejected for deal #${esc(deal?.inviteCode ?? dealId)}.`);
+      if (deal?.buyer?.telegramId) {
+        await ctx.api.sendMessage(
+          Number(deal.buyer.telegramId),
+          `<b>PAYMENT REJECTED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower could not verify your payment.\n\nReason: ${esc(text)}\n\nYou can pay again and re-report.`,
+          {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard().text("\u{2705}  I've Paid", `deal:paid:${dealId}`),
+          }
+        );
+      }
+    } catch (e: unknown) {
+      await ctx.reply(esc(e instanceof Error ? e.message : "Could not reject payment"));
+    }
+    return;
+  }
+
+  // 5. Admin: optional payment reference after verifying
+  if (ctx.session.pendingPaymentReferenceDealId) {
+    const dealId = ctx.session.pendingPaymentReferenceDealId;
+    delete ctx.session.pendingPaymentReferenceDealId;
+    if (text.toLowerCase() !== "/skip") {
+      const { prisma } = await import("../lib/db.js");
+      await prisma.deal.update({ where: { id: dealId }, data: { paymentReference: text } });
+      await ctx.reply(`Payment reference recorded for deal #${esc(dealId)}.`);
+    } else {
+      await ctx.reply("No reference recorded.");
+    }
+    return;
+  }
+
+  // 6. Admin: optional payout reference after marking released
+  if (ctx.session.pendingPayoutReferenceDealId) {
+    const dealId = ctx.session.pendingPayoutReferenceDealId;
+    delete ctx.session.pendingPayoutReferenceDealId;
+    if (text.toLowerCase() !== "/skip") {
+      const { prisma } = await import("../lib/db.js");
+      await prisma.deal.update({ where: { id: dealId }, data: { payoutReference: text } });
+      await ctx.reply(`Payout reference recorded for deal #${esc(dealId)}.`);
+    } else {
+      await ctx.reply("No reference recorded.");
+    }
+    return;
+  }
+
+  // 7. Deal form text steps (counterparty / amount / description)
+  if (ctx.session.createDealStep) {
+    const handled = await processDealFormText(ctx, text);
+    if (handled) return;
   }
 
   await next();
 });
+
+// ─── Photo handler: evidence / payment screenshot ──────────────────────
+bot.on("message:photo", async (ctx) => {
+  const fileId = ctx.message.photo?.[ctx.message.photo.length - 1]?.file_id;
+
+  if (ctx.session.pendingPaymentReportDealId) {
+    const dealId = ctx.session.pendingPaymentReportDealId;
+    delete ctx.session.pendingPaymentReportDealId;
+    const caption = ctx.message.caption?.trim() ?? "";
+    await completePaymentReport(ctx, dealId, {
+      evidence: fileId,
+      reference: caption || undefined,
+      notes: caption || undefined,
+    });
+    return;
+  }
+
+  if (ctx.session.pendingEvidenceDealId) {
+    const dealId = ctx.session.pendingEvidenceDealId;
+    delete ctx.session.pendingEvidenceDealId;
+    const caption = ctx.message.caption?.trim() ?? "";
+    await submitEvidence(ctx, dealId, caption, fileId);
+    return;
+  }
+});
+
+// ─── Payment report completion (shared by text + photo) ────────────────
+async function completePaymentReport(
+  ctx: MyContext,
+  dealId: string,
+  opts: { reference?: string; evidence?: string; notes?: string }
+) {
+  try {
+    await dealService.reportPayment(dealId, ctx.session.userId, opts);
+    const deal = await dealService.findWithParties(dealId);
+    await ctx.reply(
+      `<b>PAYMENT REPORTED</b>\n\nDeal #${esc(deal?.inviteCode ?? dealId)}\n` +
+      `The escrower has been notified and will verify your payment manually.`,
+      { reply_markup: backToMain }
+    );
+
+    await notificationService.notifyAdmins(
+      `<b>BUYER REPORTED PAYMENT</b>\n\n` +
+      `Deal: #${esc(deal?.inviteCode ?? dealId)}\n` +
+      `Amount: <b>${esc(deal?.amount?.toString() ?? "")} ${esc(deal?.asset ?? "")}</b>\n` +
+      `Payment: ${esc(deal?.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}\n` +
+      `Reported by: @${esc(ctx.session.username ?? ctx.session.firstName)}${opts.reference ? `\nReference: <code>${esc(opts.reference)}</code>` : ""}${opts.evidence ? "\n📎 Screenshot attached" : ""}`,
+      new InlineKeyboard()
+        .text("\u{2705}  Verify Payment", `admin:verify_payment:${dealId}`)
+        .text("\u{274C}  Reject Payment", `admin:reject_payment:${dealId}`)
+        .row()
+        .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${dealId}`)
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "Unknown error";
+    await ctx.reply(esc(msg), { reply_markup: backToMain });
+  }
+}
+
+// ─── Evidence submission (text or photo) ───────────────────────────────
+async function submitEvidence(ctx: MyContext, dealId: string, text: string, fileId?: string) {
+  try {
+    const { prisma } = await import("../lib/db.js");
+    const report = await prisma.paymentReport.findFirst({
+      where: { dealId, status: "PENDING" },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (!report) {
+      // No pending report — record against the deal's evidence field instead.
+      await prisma.deal.update({
+        where: { id: dealId },
+        data: {
+          paymentEvidence: fileId ?? text,
+          ...(text ? { paymentNotes: text } : {}),
+        },
+      });
+    } else {
+      await prisma.paymentReport.update({
+        where: { id: report.id },
+        data: {
+          ...(fileId ? { evidence: fileId } : {}),
+          ...(text ? { notes: report.notes ? `${report.notes}\n${text}` : text } : {}),
+        },
+      });
+    }
+
+    await prisma.escrowAuditLog.create({
+      data: { dealId, action: "EVIDENCE_SUBMITTED", userId: ctx.session.userId, notes: fileId ? "Screenshot submitted" : text },
+    });
+
+    await ctx.reply(
+      fileId
+        ? "<b>EVIDENCE SUBMITTED</b>\n\nYour screenshot has been sent to the escrower."
+        : "<b>EVIDENCE SUBMITTED</b>\n\nYour details have been sent to the escrower.",
+      { reply_markup: backToMain }
+    );
+
+    await notificationService.notifyAdmins(
+      `<b>EVIDENCE SUBMITTED</b>\n\nDeal: #${esc(dealId)}\nBy: @${esc(ctx.session.username ?? ctx.session.firstName)}\n` +
+      (fileId ? "📎 Screenshot attached." : `Notes: ${esc(text)}`),
+      new InlineKeyboard().text("Review", `admin:verify_payment:${dealId}`)
+    );
+  } catch (e: unknown) {
+    await ctx.reply(esc(e instanceof Error ? e.message : "Could not submit evidence"), { reply_markup: backToMain });
+  }
+}
 
 // ─── Admin Commands ──────────────────────────────────────────────────
 bot.command("admin", adminDashboard);
