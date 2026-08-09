@@ -9,7 +9,28 @@ import Queue from "bull";
 import { redis as redisClient } from "../lib/redis.js";
 
 // ── Withdrawal Queue ──────────────────────────────────────────────
-export const withdrawalQueue = new Queue("withdrawal", config.redisUrl, {
+// Redis may be unavailable (the app intentionally falls back to in-memory
+// sessions). Bull's default ioredis client retries its connection forever,
+// which makes withdrawalQueue.add() hang indefinitely when Redis is down.
+// Fail fast instead (mirroring the retryStrategy in src/lib/redis.ts) so the
+// DB-side flow — reservation + QUEUED status — always completes and callers
+// get a definitive outcome. The queue enqueue itself is best-effort.
+function bullRedisOptions() {
+  const url = new URL(config.redisUrl);
+  return {
+    host: url.hostname,
+    port: Number(url.port || 6379),
+    username: url.username || undefined,
+    password: url.password || undefined,
+    ...(url.protocol === "rediss:" ? { tls: {} } : {}),
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 1,
+    retryStrategy: () => null,
+  };
+}
+
+export const withdrawalQueue = new Queue("withdrawal", {
+  redis: bullRedisOptions(),
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: "exponential", delay: 30_000 },
@@ -17,6 +38,10 @@ export const withdrawalQueue = new Queue("withdrawal", config.redisUrl, {
     removeOnFail: 500,
   },
 });
+
+// Consume connection errors — without a listener, a failed Redis connection
+// emits an unhandled 'error' event and crashes the process.
+withdrawalQueue.on("error", () => {});
 
 export interface WithdrawalJob {
   withdrawalRequestId: string;
@@ -88,13 +113,23 @@ export async function requestWithdrawal(params: {
   });
 
   const jobId = `wd_${request.id}`;
-  await withdrawalQueue.add(
-    {
-      withdrawalRequestId: request.id,
-      userId, asset, amount, toAddress, network,
-    } satisfies WithdrawalJob,
-    { jobId }
-  );
+  try {
+    await withdrawalQueue.add(
+      {
+        withdrawalRequestId: request.id,
+        userId, asset, amount, toAddress, network,
+      } satisfies WithdrawalJob,
+      { jobId }
+    );
+  } catch (e) {
+    // Redis unavailable: the withdrawal is reserved and marked QUEUED in the
+    // database, but the background worker cannot pick it up. Keep going so
+    // the financial state is consistent, and log the problem loudly.
+    logger.warn(
+      { withdrawalRequestId: request.id, err: e },
+      "Could not enqueue withdrawal job (Redis unavailable) — request stays QUEUED in DB; configure Redis to process it"
+    );
+  }
 
   // Create user-facing PENDING transaction
   await prisma.transaction.create({
@@ -217,29 +252,41 @@ async function broadcastOnChain(params: {
 }
 
 // ── Run Mode ────────────────────────────────────────────────────────
-const mode = process.argv[2];
+// Only start the worker (or run reconciliation) when this file is executed
+// directly (`npm run worker:withdrawal`, `worker:reconciliation`).
+// Importing this module from the bot, admin code, or tests must NOT start a
+// worker: that would consume the queue from the wrong process and eagerly
+// open Bull's blocking/subscriber Redis connections — which fail with
+// unhandled rejections when Redis is unavailable.
+const isMainEntry =
+  typeof process.argv[1] === "string" &&
+  (process.argv[1].endsWith("withdrawal.ts") || process.argv[1].endsWith("withdrawal.js"));
 
-if (mode === "reconcile") {
-  reconciliationService.runFull()
-    .then((result) => {
-      console.log("Reconciliation result:", JSON.stringify(result, null, 2));
-      process.exit(result.ledgerViolations + result.userBalanceDiscrepancies > 0 ? 1 : 0);
-    })
-    .catch((e) => { logger.error(e); process.exit(1); });
-} else {
-  withdrawalQueue.process("withdrawal", async (bullJob) => {
-    const data = bullJob.data as WithdrawalJob;
-    await processWithdrawal(data);
-  });
+if (isMainEntry) {
+  const mode = process.argv[2];
 
-  withdrawalQueue.on("failed", (job, err) => {
-    logger.error({ jobId: job.id, err }, "Withdrawal job failed");
-  });
+  if (mode === "reconcile") {
+    reconciliationService.runFull()
+      .then((result) => {
+        console.log("Reconciliation result:", JSON.stringify(result, null, 2));
+        process.exit(result.ledgerViolations + result.userBalanceDiscrepancies > 0 ? 1 : 0);
+      })
+      .catch((e) => { logger.error(e); process.exit(1); });
+  } else {
+    withdrawalQueue.process("withdrawal", async (bullJob) => {
+      const data = bullJob.data as WithdrawalJob;
+      await processWithdrawal(data);
+    });
 
-  withdrawalQueue.on("completed", (job) => {
-    logger.info({ jobId: job.id }, "Withdrawal job completed");
-  });
+    withdrawalQueue.on("failed", (job, err) => {
+      logger.error({ jobId: job.id, err }, "Withdrawal job failed");
+    });
 
-  logger.info("Withdrawal worker started, consuming from queue");
-  setInterval(() => { logger.debug("Withdrawal worker heartbeat"); }, 60_000);
+    withdrawalQueue.on("completed", (job) => {
+      logger.info({ jobId: job.id }, "Withdrawal job completed");
+    });
+
+    logger.info("Withdrawal worker started, consuming from queue");
+    setInterval(() => { logger.debug("Withdrawal worker heartbeat"); }, 60_000);
+  }
 }
