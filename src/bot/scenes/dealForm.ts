@@ -386,7 +386,11 @@ export async function createDealFromForm(ctx: MyContext) {
     }
 
     // Post the deal card to the configured escrow group (form entry point).
-    await postDealCardToGroup(ctx, deal);
+    // On a buyer-created deal the seller has not joined yet, so pass the
+    // intended seller's username for the card instead of showing "N/A".
+    const intendedSellerUsername =
+      s.createDealRole === "seller" ? (s.username ?? null) : (s.createDealCounterpartyUsername ?? null);
+    await postDealCardToGroup(ctx, deal, intendedSellerUsername);
 
     const botInfo = await ctx.api.getMe();
     const link = `https://t.me/${botInfo.username}?start=deal_${deal.inviteCode}`;
@@ -416,7 +420,7 @@ export async function createDealFromForm(ctx: MyContext) {
 }
 
 /** Post the completed deal card to the configured escrow group. */
-export async function postDealCardToGroup(ctx: MyContext, deal: any) {
+export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSellerUsername?: string | null) {
   const groupId = config.escrowGroupId.trim();
   if (!groupId) {
     logger.info({ dealId: deal.id }, "ESCROW_GROUP_ID not configured — deal card not posted to a group");
@@ -424,7 +428,10 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any) {
   }
 
   const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
+  // If the seller has joined, use their real username; otherwise show the
+  // intended seller from the form (buyer-created deals have no sellerId yet).
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
+  const sellerName = seller?.username ?? intendedSellerUsername ?? null;
   const botInfo = await ctx.api.getMe();
   const link = `https://t.me/${botInfo.username}?start=deal_${deal.inviteCode}`;
   const cancelLink = `https://t.me/${botInfo.username}?start=cancel_${deal.inviteCode}`;
@@ -438,7 +445,7 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any) {
   try {
     await ctx.api.sendMessage(
       groupId,
-      buildDealCard(deal, buyer?.username ?? null, seller?.username ?? null),
+      buildDealCard(deal, buyer?.username ?? null, sellerName),
       { parse_mode: "HTML", reply_markup: kb }
     );
     logger.info({ dealId: deal.id, groupId }, "Deal card posted to escrow group");

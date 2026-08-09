@@ -117,10 +117,13 @@ bot.command("start", async (ctx) => {
 });
 
 // ─── /form Command + "form" text (same canonical flow as the button) ──
+// The form collects deal details, so it only starts in a private chat.
 bot.command("form", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
   await startDealForm(ctx);
 });
 bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
   await startDealForm(ctx);
 });
 
