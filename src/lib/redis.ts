@@ -8,7 +8,17 @@ export const redis =
   new Redis(config.redisUrl, {
     maxRetriesPerRequest: 3,
     lazyConnect: true,
+    // Do not retry the connection forever: the bot explicitly supports an
+    // in-memory session fallback when Redis is unavailable, and an endless
+    // reconnect loop would spam "[ioredis] Unhandled error event" every few
+    // seconds. connect() failures are handled by the caller.
+    retryStrategy: () => null,
   });
+
+// Consume connection error events. Without a listener ioredis prints an
+// "[ioredis] Unhandled error event" stack trace on every failed attempt;
+// the caller handles connect() failures by falling back to in-memory sessions.
+redis.on("error", () => {});
 
 if (process.env.NODE_ENV !== "production") {
   globalForRedis.redis = redis;
