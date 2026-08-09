@@ -30,8 +30,13 @@ export const config = {
 
   // Telegram
   botToken: required("BOT_TOKEN"),
+  // Admin ids are read from ADMIN_TELEGRAM_IDS, with ADMIN_IDS kept as a
+  // fallback for deployments configured before the rename.
   adminTelegramIds: new Set(
-    (process.env.ADMIN_TELEGRAM_IDS ?? "").split(",").map(Number).filter(Boolean)
+    (process.env.ADMIN_TELEGRAM_IDS ?? process.env.ADMIN_IDS ?? "")
+      .split(",")
+      .map(Number)
+      .filter(Boolean)
   ),
 
   // Database
