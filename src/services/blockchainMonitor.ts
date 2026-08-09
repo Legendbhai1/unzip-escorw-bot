@@ -2,7 +2,7 @@ import { prisma } from "../lib/db.js";
 import { treasuryService } from "./treasuryService.js";
 import { tronService } from "./tronService.js";
 import { bscService } from "./bscService.js";
-import { getUserDepositAddress } from "./depositAddressService.js";
+import { getMonitoredAddresses, getUserIdForAddress } from "./depositAddressService.js";
 import { notificationService } from "./notificationService.js";
 import { logger } from "../lib/logger.js";
 import { config } from "../config/index.js";
@@ -152,8 +152,17 @@ export const blockchainMonitor = {
     // 3. Check if we have enough confirmations
     const requiredConfs = this.getMinConfirmations(network);
     if (confirmations < requiredConfs) {
-      await prisma.blockchainDeposit.create({
-        data: {
+      // Upsert (not create) so a re-poll racing the first write can never
+      // create a duplicate PENDING record for the same on-chain event.
+      await prisma.blockchainDeposit.upsert({
+        where: {
+          blockchain_deposit_unique: {
+            network,
+            txHash: txHashLower,
+            logIndex,
+          },
+        },
+        create: {
           userId,
           txHash: txHashLower,
           logIndex,
@@ -166,6 +175,7 @@ export const blockchainMonitor = {
           requiredConfs,
           status: "PENDING",
         },
+        update: { confirmations, amount },
       });
       logger.info(
         { txHash: txHashLower, confirmations, requiredConfs, userId },
@@ -256,27 +266,17 @@ export const blockchainMonitor = {
   },
 
   /**
-   * Resolve userId from a deposit address.
-   * For static addresses, returns null (unattributed).
-   * In production with per-user HD addresses, this would look up
-   * address -> userId mapping.
+   * Resolve userId from a deposit address via the persisted
+   * (network, asset, address) -> userId mapping. Returns null when the
+   * address is not one of our deposit addresses (recorded as unattributed).
    */
   async resolveUserId(
     toAddress: string,
     network: string,
-    txHash: string,
-    fromAddress: string,
+    _txHash: string,
+    _fromAddress: string,
   ): Promise<string | null> {
-    const staticAddr = process.env[`DEPOSIT_ADDRESS_${network}`];
-    if (staticAddr && staticAddr.toLowerCase() === toAddress.toLowerCase()) {
-      // Static address: can't determine user from address alone.
-      // Production improvement: use memo/tag or require user to register their TX.
-      return null;
-    }
-
-    // For per-user derived addresses, we'd need a reverse lookup.
-    // This is a placeholder for HD wallet implementation.
-    return null;
+    return getUserIdForAddress(toAddress, network, "USDT");
   },
 
   getMinConfirmations(network: string): number {
@@ -291,7 +291,7 @@ export const blockchainMonitor = {
    */
   async pollTron() {
     try {
-      const addresses = await getMonitoredAddresses();
+      const addresses = await getMonitoredAddresses("TRC20", "USDT");
       if (addresses.length === 0) {
         logger.debug("No TRC20 addresses to monitor");
         return;
@@ -304,12 +304,27 @@ export const blockchainMonitor = {
         const transfers = await tronService.getTrc20Transfers(addr, undefined, minTs);
 
         for (const t of transfers) {
-          // TRC20 API does not expose a log index — keep logIndex undefined so
-          // it defaults to 0. Using the batch position would make the dedup key
-          // (network, txHash, logIndex) unstable across polls and could cause
-          // duplicate credits for the same transaction.
-          const detected = tronService.parseTrc20Transfer(t, latestBlock);
-          await this.processDeposit(detected);
+          try {
+            // TRC20 API does not expose a log index — keep logIndex undefined so
+            // it defaults to 0. Using the batch position would make the dedup key
+            // (network, txHash, logIndex) unstable across polls and could cause
+            // duplicate credits for the same transaction.
+            //
+            // The transfer object has no block number, so fetch the tx info once
+            // to compute real confirmations; without it TRC20 deposits would stay
+            // PENDING forever (0 confirmations).
+            let txBlockNumber: number | undefined;
+            try {
+              const txInfo = await tronService.getTransactionInfo(t.transaction_id);
+              txBlockNumber = txInfo.blockNumber;
+            } catch {
+              /* tx info unavailable -> 0 confirmations this poll */
+            }
+            const detected = tronService.parseTrc20Transfer(t, latestBlock, txBlockNumber);
+            await this.processDeposit(detected);
+          } catch (e) {
+            logMonitorError(e);
+          }
         }
       }
 
@@ -326,7 +341,7 @@ export const blockchainMonitor = {
    */
   async pollBsc() {
     try {
-      const addresses = await getMonitoredAddresses();
+      const addresses = await getMonitoredAddresses("BEP20", "USDT");
       if (addresses.length === 0) {
         logger.debug("No BEP20 addresses to monitor");
         return;
@@ -405,17 +420,4 @@ export const blockchainMonitor = {
   },
 };
 
-/**
- * Get all monitored deposit addresses.
- * Returns unique platform addresses for all active users.
- */
-async function getMonitoredAddresses(): Promise<string[]> {
-  const staticAddrTRC20 = process.env.DEPOSIT_ADDRESS_TRC20;
-  const staticAddrBEP20 = process.env.DEPOSIT_ADDRESS_BEP20;
 
-  const addresses: string[] = [];
-  if (staticAddrTRC20) addresses.push(staticAddrTRC20);
-  if (staticAddrBEP20) addresses.push(staticAddrBEP20);
-
-  return [...new Set(addresses)];
-}

@@ -1,9 +1,11 @@
+import { InlineKeyboard } from "grammy";
 import { treasuryService } from "../../services/treasuryService.js";
 import { dealService } from "../../services/dealService.js";
 import { getUserDepositAddress } from "../../services/depositAddressService.js";
 import { walletMenu, dealTabs, backToMain } from "../keyboards/index.js";
-import { InlineKeyboard } from "grammy";
 import { config } from "../../config/index.js";
+import { logger } from "../../lib/logger.js";
+import { esc } from "../../lib/html.js";
 
 type Ctx = any;
 
@@ -13,9 +15,7 @@ export async function showWallet(ctx: Ctx) {
 
   if (balances.length === 0) {
     await ctx.reply(
-      `<b>WALLET</b>
-
-No balances yet. Deposit funds to get started.`,
+      `<b>WALLET</b>\n\nNo balances yet. Deposit funds to get started.`,
       { reply_markup: walletMenu }
     );
     return;
@@ -24,7 +24,7 @@ No balances yet. Deposit funds to get started.`,
   const lines = balances
     .map((b: any) => {
       const total = (parseFloat(b.available) + parseFloat(b.locked)).toFixed(8);
-      return `<b>${b.asset}</b>  Available: ${parseFloat(b.available).toFixed(2)}  Locked: ${parseFloat(b.locked).toFixed(2)}  Total: ${total}`;
+      return `<b>${esc(b.asset)}</b>  Available: ${parseFloat(b.available).toFixed(2)}  Locked: ${parseFloat(b.locked).toFixed(2)}  Total: ${total}`;
     })
     .join("\n");
 
@@ -34,23 +34,50 @@ No balances yet. Deposit funds to get started.`,
   );
 }
 
+function depositKeyboard() {
+  return new InlineKeyboard()
+    .text("TRC20", "wallet:deposit_trc20")
+    .text("BEP20", "wallet:deposit_bep20")
+    .row()
+    .text("Back to Wallet", "wallet:back");
+}
+
 export async function showDeposit(ctx: Ctx) {
   const userId = ctx.session.userId;
-  const session = ctx.session;
-  const network = session.depositNetwork ?? "TRC20";
-  const address = getUserDepositAddress(userId, network);
+  const network = (ctx.session.depositNetwork ?? "TRC20").toUpperCase();
+
+  // Get the real per-user deposit address. Returns null when the deposit
+  // mnemonic is not configured — in that case we NEVER show a fabricated
+  // address; the user gets a clear "temporarily unavailable" message.
+  let address: string | null = null;
+  try {
+    address = await getUserDepositAddress(userId, network, "USDT");
+  } catch (e) {
+    logger.error({ userId, network, err: e }, "Failed to load deposit address");
+  }
+
+  if (!address) {
+    logger.warn(
+      { userId, network },
+      "Deposit screen requested but no deposit address is configured (DEPOSIT_HD_MNEMONIC)"
+    );
+    await ctx.reply(
+      `<b>DEPOSIT</b>\n\nDeposits temporarily unavailable — address not configured.\n\nPlease contact support.`,
+      { reply_markup: depositKeyboard() }
+    );
+    return;
+  }
+
+  const buyerFeePct = (config.buyerFeeBps / 100).toFixed(config.buyerFeeBps % 100 === 0 ? 0 : 2);
+  const sellerFeePct = (config.sellerFeeBps / 100).toFixed(config.sellerFeeBps % 100 === 0 ? 0 : 2);
 
   await ctx.reply(
     `<b>DEPOSIT</b>\n\n` +
-    `Send <b>USDT</b> on <b>${network}</b> to:\n\n<code>${address}</code>\n\n` +
+    `Send <b>USDT</b> on <b>${esc(network)}</b> to:\n\n<code>${esc(address)}</code>\n\n` +
     `Funds will be credited to your wallet after confirmations.\n` +
     `Then fund your deal from your wallet balance.\n\n` +
-    `Fee: Buyer ${(config.buyerFeeBps / 100)}% | Seller ${(config.sellerFeeBps / 100)}%`,
-    { reply_markup: new InlineKeyboard()
-      .text("TRC20", "wallet:deposit_trc20")
-      .text("BEP20", "wallet:deposit_bep20")
-      .row()
-      .text("Back to Wallet", "wallet:back") }
+    `Fee: Buyer ${buyerFeePct}% | Seller ${sellerFeePct}%`,
+    { reply_markup: depositKeyboard() }
   );
 }
 
@@ -75,7 +102,7 @@ export async function showMyDeals(ctx: Ctx, tab: "active" | "completed" | "dispu
   }
 
   if (deals.length === 0) {
-    await ctx.reply(`<b>MY ${tab.toUpperCase()} DEALS</b>\n\nNo ${tab} deals found.`, { reply_markup: dealTabs });
+    await ctx.reply(`<b>MY ${esc(tab.toUpperCase())} DEALS</b>\n\nNo ${esc(tab)} deals found.`, { reply_markup: dealTabs });
     return;
   }
 
@@ -94,12 +121,12 @@ export async function showMyDeals(ctx: Ctx, tab: "active" | "completed" | "dispu
       const isBuyer = d.buyerId === userId;
       const otherParty = isBuyer ? d.seller : d.buyer;
       const emoji = statusEmoji[d.status] ?? "";
-      return `${emoji} <code>#${d.inviteCode}</code>  ${d.amount} ${d.asset}\n   ${isBuyer ? "Buyer" : "Seller"} <-> @${otherParty?.username ?? "N/A"}`;
+      return `${emoji} <code>#${esc(d.inviteCode)}</code>  ${esc(d.amount)} ${esc(d.asset)}\n   ${isBuyer ? "Buyer" : "Seller"} <-> @${esc(otherParty?.username ?? "N/A")}`;
     })
     .join("\n");
 
   await ctx.reply(
-    `<b>MY ${tab.toUpperCase()} DEALS</b>\n${dealList}` +
+    `<b>MY ${esc(tab.toUpperCase())} DEALS</b>\n${dealList}` +
     (deals.length > 10 ? `\n\nShowing 10 of ${deals.length} deals` : ""),
     { reply_markup: dealTabs }
   );

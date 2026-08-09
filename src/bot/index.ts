@@ -11,11 +11,27 @@ import { handleRelease, handleReleaseConfirm, handleDeliver, handleDispute, hand
 import { showWallet, showDeposit, showMyDeals } from "./scenes/walletAndDeals.js";
 import { notificationService } from "../services/notificationService.js";
 import { logger } from "../lib/logger.js";
+import { esc } from "../lib/html.js";
 import type { MyContext, SessionData } from "./context.js";
 import { adminDashboard, listDisputes, reviewDispute, handleAdminCallback, banUser, suspendUser, lookupUser } from "./admin.js";
 
 // ─── Bot Setup ────────────────────────────────────────────────────────
 const bot = new Bot<MyContext>(config.botToken);
+
+// ─── Global HTML parse-mode ───────────────────────────────────────────
+// Every sendMessage / editMessageText goes through this transformer so HTML
+// formatting (<b>, <i>, <code>) renders everywhere. User-provided text is
+// escaped at the call sites via esc() — see src/lib/html.ts. An explicit
+// parse_mode on a call (if ever added) is never overridden.
+bot.api.config.use((prev, method, payload, signal) => {
+  if (method === "sendMessage" || method === "editMessageText") {
+    const p = payload as Record<string, unknown>;
+    if (typeof p.text === "string" && !p.parse_mode) {
+      p.parse_mode = "HTML";
+    }
+  }
+  return prev(method, payload, signal);
+});
 
 // ─── Session Middleware (Redis-backed) ─────────────────────────────────
 bot.use(session({
@@ -89,6 +105,9 @@ bot.on("callback_query:data", async (ctx) => {
 
   // ── Main Menu ──
   if (data === "menu:main") {
+    // Leaving the create-deal flow: drop any in-progress step so a later
+    // text message is not silently consumed by the abandoned flow.
+    ctx.session.createDealStep = undefined;
     await ctx.editMessageText(
       "<b>ESCROW</b>\n\nSecure your trades with our escrow system.",
       { reply_markup: mainMenu }
@@ -137,19 +156,32 @@ bot.on("callback_query:data", async (ctx) => {
   }
   if (data === "wallet:deposit") {
     ctx.session.depositNetwork = "TRC20";
-    await showDeposit(ctx);
+    await ctx.answerCallbackQuery();
+    try {
+      await showDeposit(ctx);
+    } catch (e: unknown) {
+      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
+    }
     return;
   }
   if (data === "wallet:deposit_trc20") {
     ctx.session.depositNetwork = "TRC20";
-    await showDeposit(ctx);
     await ctx.answerCallbackQuery();
+    try {
+      await showDeposit(ctx);
+    } catch (e: unknown) {
+      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
+    }
     return;
   }
   if (data === "wallet:deposit_bep20") {
     ctx.session.depositNetwork = "BEP20";
-    await showDeposit(ctx);
     await ctx.answerCallbackQuery();
+    try {
+      await showDeposit(ctx);
+    } catch (e: unknown) {
+      await ctx.reply(`Error opening deposit: ${esc(e instanceof Error ? e.message : "Unknown error")}`, { reply_markup: backToMain });
+    }
     return;
   }
   if (data === "wallet:withdraw") {
@@ -291,14 +323,14 @@ bot.on("callback_query:data", async (ctx) => {
 
     await ctx.reply(
       `<b>DEAL SUMMARY</b>\n\n` +
-      `${s.createDealRole === "buyer" ? "Seller" : "Buyer"}: @${s.createDealCounterpartyUsername}\n` +
-      `${s.createDealRole === "buyer" ? "Buyer" : "Seller"}: @${s.username ?? s.firstName}\n\n` +
-      `Amount: ${s.createDealAmount} ${s.createDealAsset}\n` +
-      `Buyer fee (${buyerFeePct}%): ${buyerFee} ${s.createDealAsset}\n` +
-      `Seller fee (${sellerFeePct}%): ${sellerFee} ${s.createDealAsset}\n` +
-      `Buyer pays total: ${(amount + parseFloat(buyerFee)).toFixed(2)} ${s.createDealAsset}\n` +
-      `Seller receives: ${(amount - parseFloat(sellerFee)).toFixed(2)} ${s.createDealAsset}\n\n` +
-      `Item: ${s.createDealDescription}\n\n` +
+      `${s.createDealRole === "buyer" ? "Seller" : "Buyer"}: @${esc(s.createDealCounterpartyUsername ?? "")}\n` +
+      `${s.createDealRole === "buyer" ? "Buyer" : "Seller"}: @${esc(s.username ?? s.firstName)}\n\n` +
+      `Amount: ${esc(s.createDealAmount)} ${esc(s.createDealAsset)}\n` +
+      `Buyer fee (${buyerFeePct}%): ${buyerFee} ${esc(s.createDealAsset)}\n` +
+      `Seller fee (${sellerFeePct}%): ${sellerFee} ${esc(s.createDealAsset)}\n` +
+      `Buyer pays total: ${(amount + parseFloat(buyerFee)).toFixed(2)} ${esc(s.createDealAsset)}\n` +
+      `Seller receives: ${(amount - parseFloat(sellerFee)).toFixed(2)} ${esc(s.createDealAsset)}\n\n` +
+      `Item: ${esc(s.createDealDescription)}\n\n` +
       `Everything correct?`,
       { reply_markup: dealConfirm() }
     );
@@ -397,14 +429,40 @@ bot.on("message:text", async (ctx, next) => {
 
   // Counterparty username
   if (step === "counterparty") {
-    const username = text.replace("@", "").trim();
-    const otherUser = await userService.findByUsername(username);
+    // Normalize: trim, strip leading @ (e.g. "@username" -> "username").
+    const normalized = text.replace(/^@+/, "").trim();
+    // Telegram usernames: 5-32 chars, letters/digits/underscore.
+    const usernameRe = /^[A-Za-z0-9_]{5,32}$/;
+
+    if (!normalized) {
+      await ctx.reply("Please enter the other party's Telegram username, e.g. <code>@username</code>.");
+      return; // stay on the counterparty step
+    }
+    if (!usernameRe.test(normalized)) {
+      await ctx.reply(
+        "That doesn't look like a valid Telegram username.\n\n" +
+        "Usernames are 5–32 characters and may only contain letters, numbers and underscores.\n\n" +
+        "Example: <code>@john_doe</code>\n\nPlease try again:"
+      );
+      return; // stay on the counterparty step
+    }
+
+    const otherUser = await userService.findByUsername(normalized);
     if (!otherUser) {
-      await ctx.reply(`User @${username} not found. They must start the bot first.`, { reply_markup: backToMain });
-      ctx.session.createDealStep = undefined;
+      // Do NOT clear the step: keep the user here so they can retry.
+      await ctx.reply(
+        `User <code>@${esc(normalized)}</code> was not found.\n\n` +
+        `The other person must start this bot first — ask them to send <code>/start</code> to the bot, then enter their username again.`
+      );
       return;
     }
-    ctx.session.createDealCounterpartyUsername = username;
+
+    if (otherUser.id === ctx.session.userId) {
+      await ctx.reply("You can't create a deal with yourself. Please enter the other party's username:");
+      return; // stay on the counterparty step
+    }
+
+    ctx.session.createDealCounterpartyUsername = otherUser.username ?? normalized;
     ctx.session.createDealCounterpartyUserId = otherUser.id;
     await ctx.reply("<b>DEAL AMOUNT</b>\n\nEnter the amount:\n\n<i>Example: 100</i>", { reply_markup: backToMain });
     ctx.session.createDealStep = "amount";

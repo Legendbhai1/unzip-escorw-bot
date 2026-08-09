@@ -2,6 +2,7 @@ import { InlineKeyboard } from "grammy";
 import { dealService } from "../../services/dealService.js";
 import { backToMain } from "../keyboards/index.js";
 import { config } from "../../config/index.js";
+import { esc } from "../../lib/html.js";
 
 type Ctx = any;
 
@@ -26,7 +27,7 @@ export async function handleRelease(ctx: Ctx, dealId: string) {
   }
 
   if (deal.status !== "DELIVERED") {
-    await ctx.reply(`Cannot release from ${deal.status} state.`);
+    await ctx.reply(`Cannot release from ${esc(deal.status)} state.`);
     return;
   }
 
@@ -38,10 +39,10 @@ export async function handleRelease(ctx: Ctx, dealId: string) {
 
   await ctx.reply(
     `<b>CONFIRM RELEASE</b>\n\n` +
-    `Escrow amount: ${deal.amount} ${deal.asset}\n` +
-    `Seller fee (${sellerFeePct}): ${sellerFee.toFixed(8)} ${deal.asset}\n` +
-    `Seller receives: ${sellerReceives.toFixed(8)} ${deal.asset}\n\n` +
-    `To: @${deal.seller?.username ?? "N/A"}\n\n` +
+    `Escrow amount: ${esc(deal.amount.toString())} ${esc(deal.asset)}\n` +
+    `Seller fee (${sellerFeePct}): ${sellerFee.toFixed(8)} ${esc(deal.asset)}\n` +
+    `Seller receives: ${sellerReceives.toFixed(8)} ${esc(deal.asset)}\n\n` +
+    `To: @${esc(deal.seller?.username ?? "N/A")}\n\n` +
     `This action cannot normally be reversed.`,
     {
       reply_markup: new InlineKeyboard()
@@ -57,15 +58,15 @@ export async function handleReleaseConfirm(ctx: Ctx, dealId: string) {
     const deal = await dealService.findWithParties(dealId);
     await ctx.reply(
       `<b>DEAL COMPLETED</b>\n\n` +
-      `${deal?.amount} ${deal?.asset} released to @${deal?.seller?.username ?? "N/A"}.\n` +
-      `Seller fee: ${result.sellerFee} ${deal?.asset}\n` +
-      `Seller received: ${result.sellerReceives} ${deal?.asset}\n\n` +
-      `Deal ID: #${deal?.inviteCode}`,
+      `${esc(deal?.amount.toString() ?? "")} ${esc(deal?.asset ?? "")} released to @${esc(deal?.seller?.username ?? "N/A")}.\n` +
+      `Seller fee: ${esc(result.sellerFee)} ${esc(deal?.asset ?? "")}\n` +
+      `Seller received: ${esc(result.sellerReceives)} ${esc(deal?.asset ?? "")}\n\n` +
+      `Deal ID: #${esc(deal?.inviteCode ?? "")}`,
       { reply_markup: backToMain }
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
-    await ctx.reply(msg, { reply_markup: backToMain });
+    await ctx.reply(esc(msg), { reply_markup: backToMain });
   }
 }
 
@@ -92,7 +93,7 @@ export async function handleDeliver(ctx: Ctx, dealId: string) {
       try {
         await ctx.api.sendMessage(
           Number(deal.buyer.telegramId),
-          `<b>SELLER MARKED DEAL AS DELIVERED</b>\n\nDeal #${deal.inviteCode}\nPlease verify that you received what was agreed.`,
+          `<b>SELLER MARKED DEAL AS DELIVERED</b>\n\nDeal #${esc(deal.inviteCode)}\nPlease verify that you received what was agreed.`,
           {
             reply_markup: new InlineKeyboard()
               .text("Accept & Release", `deal:release:${dealId}`)
@@ -103,7 +104,7 @@ export async function handleDeliver(ctx: Ctx, dealId: string) {
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
-    await ctx.reply(msg, { reply_markup: backToMain });
+    await ctx.reply(esc(msg), { reply_markup: backToMain });
   }
 }
 
@@ -127,7 +128,7 @@ export async function handleDisputeReason(ctx: Ctx, reason: string) {
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
-    await ctx.reply(msg, { reply_markup: backToMain });
+    await ctx.reply(esc(msg), { reply_markup: backToMain });
   }
 
   delete ctx.session.pendingDisputeDealId;

@@ -5,6 +5,7 @@ import { config } from "../config/index.js";
 import { notificationService } from "../services/notificationService.js";
 import type { MyContext } from "./context.js";
 import { logger } from "../lib/logger.js";
+import { esc } from "../lib/html.js";
 
 export async function adminDashboard(ctx: MyContext) {
   if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) return;
@@ -54,11 +55,11 @@ export async function listDisputes(ctx: MyContext) {
     const deal = d.deal;
     if (!deal) return "";
     return (
-      "<b>#" + deal.inviteCode + "</b> -- " + deal.status + "\n" +
-      "Amount: " + deal.amount + " " + deal.asset + "\n" +
-      "Buyer: @" + (deal.buyer?.username ?? "N/A") + " | Seller: @" + (deal.seller?.username ?? "N/A") + "\n" +
-      "Opened by: @" + (d.opener?.username ?? "N/A") + "\n" +
-      "Reason: " + d.reason.slice(0, 80) + "\n" +
+      "<b>#" + esc(deal.inviteCode) + "</b> -- " + esc(deal.status) + "\n" +
+      "Amount: " + esc(deal.amount.toString()) + " " + esc(deal.asset) + "\n" +
+      "Buyer: @" + esc(deal.buyer?.username ?? "N/A") + " | Seller: @" + esc(deal.seller?.username ?? "N/A") + "\n" +
+      "Opened by: @" + esc(d.opener?.username ?? "N/A") + "\n" +
+      "Reason: " + esc(d.reason.slice(0, 80)) + "\n" +
       "----------"
     );
   }).join("\n");
@@ -86,7 +87,7 @@ export async function reviewDispute(ctx: MyContext) {
   }
 
   const evidenceList = deal.dispute.evidence.length > 0
-    ? deal.dispute.evidence.map((e, i) => (i + 1) + ". " + e.message).join("\n")
+    ? deal.dispute.evidence.map((e, i) => (i + 1) + ". " + esc(e.message)).join("\n")
     : "No evidence submitted yet.";
 
   const kb = new InlineKeyboard()
@@ -97,12 +98,12 @@ export async function reviewDispute(ctx: MyContext) {
     .text("Assign to Me", "admin:assign:" + deal.id);
 
   await ctx.reply(
-    "<b>DISPUTE REVIEW: #" + deal.inviteCode + "</b>\n\n" +
-    "Buyer: @" + (deal.buyer?.username ?? "N/A") + " (" + deal.buyerId + ")\n" +
-    "Seller: @" + (deal.seller?.username ?? "N/A") + " (" + deal.sellerId + ")\n" +
-    "Amount: " + deal.amount + " " + deal.asset + "\n" +
-    "Status: " + deal.status + "\n\n" +
-    "<b>Reason:</b> " + deal.dispute.reason + "\n\n" +
+    "<b>DISPUTE REVIEW: #" + esc(deal.inviteCode) + "</b>\n\n" +
+    "Buyer: @" + esc(deal.buyer?.username ?? "N/A") + " (" + esc(deal.buyerId) + ")\n" +
+    "Seller: @" + esc(deal.seller?.username ?? "N/A") + " (" + esc(deal.sellerId ?? "") + ")\n" +
+    "Amount: " + esc(deal.amount.toString()) + " " + esc(deal.asset) + "\n" +
+    "Status: " + esc(deal.status) + "\n\n" +
+    "<b>Reason:</b> " + esc(deal.dispute.reason) + "\n\n" +
     "<b>Evidence:</b>\n" + evidenceList,
     { reply_markup: kb }
   );
@@ -218,7 +219,7 @@ export async function banUser(ctx: MyContext) {
   await prisma.adminAction.create({ data: { adminId: ctx.session.userId, actionType: "USER_BAN", reason } });
 
   logger.warn({ adminId: ctx.session.userId, bannedUserId: user.id, reason }, "User banned");
-  await ctx.reply("User @" + (user.username ?? user.id) + " has been banned.\nReason: " + reason);
+  await ctx.reply("User @" + esc(user.username ?? user.id) + " has been banned.\nReason: " + esc(reason));
 }
 
 export async function suspendUser(ctx: MyContext) {
@@ -242,7 +243,7 @@ export async function suspendUser(ctx: MyContext) {
   await prisma.adminAction.create({ data: { adminId: ctx.session.userId, actionType: "USER_SUSPEND", reason } });
 
   logger.warn({ adminId: ctx.session.userId, suspendedUserId: user.id, reason }, "User suspended");
-  await ctx.reply("User @" + (user.username ?? user.id) + " has been suspended.\nReason: " + reason);
+  await ctx.reply("User @" + esc(user.username ?? user.id) + " has been suspended.\nReason: " + esc(reason));
 }
 
 export async function lookupUser(ctx: MyContext) {
@@ -272,10 +273,10 @@ export async function lookupUser(ctx: MyContext) {
 
   const profileText =
     "<b>USER PROFILE</b>\n\n" +
-    "ID: <code>" + user.id + "</code>\n" +
-    "Telegram: @" + (user.username ?? "N/A") + " (" + user.telegramId + ")\n" +
-    "Name: " + user.firstName + "\n" +
-    "Status: <b>" + user.status + "</b>\n" +
+    "ID: <code>" + esc(user.id) + "</code>\n" +
+    "Telegram: @" + esc(user.username ?? "N/A") + " (" + esc(user.telegramId.toString()) + ")\n" +
+    "Name: " + esc(user.firstName) + "\n" +
+    "Status: <b>" + esc(user.status) + "</b>\n" +
     "Deals: " + dealCount + "\n" +
     "Disputes Opened: " + disputeCount + "\n" +
     "Joined: " + user.createdAt.toISOString().slice(0, 10);

@@ -22,6 +22,7 @@ async function cleanAll() {
   await prisma.transaction.deleteMany();
   await prisma.withdrawalRequest.deleteMany();
   await prisma.blockchainDeposit.deleteMany();
+  await prisma.depositAddress.deleteMany();
   await prisma.balance.deleteMany();
   await prisma.deal.deleteMany();
 }

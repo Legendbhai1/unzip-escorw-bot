@@ -3,6 +3,7 @@ import { userService } from "../../services/userService.js";
 import { dealService } from "../../services/dealService.js";
 import { acceptRejectDeal, backToMain, dealActions } from "../keyboards/index.js";
 import { config } from "../../config/index.js";
+import { esc } from "../../lib/html.js";
 
 type Ctx = any;
 
@@ -39,15 +40,15 @@ export async function handleJoinDeal(ctx: Ctx, inviteCode: string) {
     `<b>ESCROW DEAL</b>
 
 ` +
-    `Deal #<code>${deal.inviteCode}</code>
+    `Deal #<code>${esc(deal.inviteCode)}</code>
 
 ` +
-    `Buyer: @${buyer?.username ?? "N/A"}\n` +
-    `Seller: @${ctx.session.username ?? ctx.session.firstName}\n\n` +
-    `Amount: ${deal.amount} ${deal.asset}\n` +
+    `Buyer: @${esc(buyer?.username ?? "N/A")}\n` +
+    `Seller: @${esc(ctx.session.username ?? ctx.session.firstName)}\n\n` +
+    `Amount: ${esc(deal.amount.toString())} ${esc(deal.asset)}\n` +
     `Buyer fee: ${buyerFeePct}%\n` +
     `Seller fee: ${sellerFeePct}%\n\n` +
-    `Description:\n${deal.description}\n\n` +
+    `Description:\n${esc(deal.description)}\n\n` +
     `Do you accept these terms?`,
     { reply_markup: acceptRejectDeal() }
   );
@@ -104,16 +105,16 @@ export async function showDealStatus(ctx: Ctx, dealId: string) {
   const sellerFeePct = (deal.sellerFeeBps ?? config.sellerFeeBps) / 100;
 
   await ctx.reply(
-    `<b>ESCROW DEAL #${deal.inviteCode}</b>\n\n` +
-    `Status: ${emoji} <b>${statusLabel}</b>\n\n` +
-    `Your role: ${roleLabel}\n` +
-    `Buyer: @${deal.buyer?.username ?? "N/A"}\n` +
-    `Seller: @${deal.seller?.username ?? "N/A"}\n\n` +
-    `Amount: ${deal.amount} ${deal.asset}\n` +
-    `Network: ${deal.network}\n` +
+    `<b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
+    `Status: ${emoji} <b>${esc(statusLabel)}</b>\n\n` +
+    `Your role: ${esc(roleLabel)}\n` +
+    `Buyer: @${esc(deal.buyer?.username ?? "N/A")}\n` +
+    `Seller: @${esc(deal.seller?.username ?? "N/A")}\n\n` +
+    `Amount: ${esc(deal.amount.toString())} ${esc(deal.asset)}\n` +
+    `Network: ${esc(deal.network)}\n` +
     `Buyer fee: ${buyerFeePct}%\n` +
     `Seller fee: ${sellerFeePct}%\n\n` +
-    `Item: ${deal.description}\n\n` +
+    `Item: ${esc(deal.description)}\n\n` +
     `Payment: ${paymentOk ? "Secured" : "Pending"}\n` +
     `Delivery: ${deliveryOk ? "Done" : "Pending"}\n` +
     `Release: ${releaseOk ? "Done" : "Pending"}\n\n` +

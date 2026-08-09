@@ -1,5 +1,6 @@
 import { prisma } from "../lib/db.js";
 import { logger } from "../lib/logger.js";
+import { esc } from "../lib/html.js";
 
 // Lazy import to avoid circular dependency with bot/index.ts
 let _bot: any = null;
@@ -38,9 +39,9 @@ export const notificationService = {
       await b.api.sendMessage(Number(user.telegramId),
         `<b>NEW ESCROW DEAL</b>\n\n` +
         `A deal has been created involving you:\n\n` +
-        `Amount: <b>${amount} ${asset}</b>\n` +
-        `Item: ${description.slice(0, 100)}\n\n` +
-        `Tap below to review and accept:\n${link}`,
+        `Amount: <b>${esc(amount)} ${esc(asset)}</b>\n` +
+        `Item: ${esc(description.slice(0, 100))}\n\n` +
+        `Tap below to review and accept:\n${esc(link)}`,
         { parse_mode: "HTML" }
       );
     } catch (e) {
@@ -61,7 +62,7 @@ export const notificationService = {
       const b = await getBot();
       await b.api.sendMessage(Number(buyerTelegramId),
         `<b>DEAL FUNDED</b>\n\n` +
-        `Deal #<code>${inviteCode}</code> is now funded with ${amount} ${asset}.\n\n` +
+        `Deal #<code>${esc(inviteCode)}</code> is now funded with ${esc(amount)} ${esc(asset)}.\n\n` +
         `The seller can now deliver the item/service.`,
         { parse_mode: "HTML" }
       );
@@ -81,7 +82,7 @@ export const notificationService = {
       const b = await getBot();
       await b.api.sendMessage(Number(buyerTelegramId),
         `<b>DELIVERY MARKED</b>\n\n` +
-        `Deal #<code>${inviteCode}</code>\n\n` +
+        `Deal #<code>${esc(inviteCode)}</code>\n\n` +
         `The seller has marked this deal as delivered.\n` +
         `Please verify that you received what was agreed.`,
         { parse_mode: "HTML" }
@@ -102,7 +103,7 @@ export const notificationService = {
   ) {
     const msg =
       `<b>DISPUTE OPENED</b>\n\n` +
-      `Deal #<code>${inviteCode}</code> has been disputed by @${openedBy}.\n\n` +
+      `Deal #<code>${esc(inviteCode)}</code> has been disputed by @${esc(openedBy)}.\n\n` +
       `The deal is now frozen. An admin will review.\n` +
       `Do NOT send funds outside the escrow.`;
 
@@ -132,9 +133,9 @@ export const notificationService = {
 
     const msg =
       `<b>DISPUTE RESOLVED</b>\n\n` +
-      `Deal #<code>${inviteCode}</code>\n` +
-      `${resolutionText}\n\n` +
-      `Admin note: ${reason}`;
+      `Deal #<code>${esc(inviteCode)}</code>\n` +
+      `${esc(resolutionText)}\n\n` +
+      `Admin note: ${esc(reason)}`;
 
     const b = await getBot();
     for (const tid of [buyerTelegramId, sellerTelegramId]) {
@@ -162,8 +163,8 @@ export const notificationService = {
       const b = await getBot();
       await b.api.sendMessage(Number(user.telegramId),
         `<b>WITHDRAWAL COMPLETE</b>\n\n` +
-        `${amount} ${asset} withdrawn successfully.\n\n` +
-        `TX: <code>${txHash}</code>`,
+        `${esc(amount)} ${esc(asset)} withdrawn successfully.\n\n` +
+        `TX: <code>${esc(txHash)}</code>`,
         { parse_mode: "HTML" }
       );
     } catch (e) {
@@ -202,8 +203,8 @@ export const notificationService = {
 
       let msg =
         `<b>DEPOSIT CREDITED</b>\n\n` +
-        `${amount} ${asset} has been credited to your wallet.\n\n` +
-        `TX: <code>${txHash}</code>`;
+        `${esc(amount)} ${esc(asset)} has been credited to your wallet.\n\n` +
+        `TX: <code>${esc(txHash)}</code>`;
 
       if (dealInviteCode) {
         msg += `\n\nDeal #${dealInviteCode} has been funded automatically.`;

@@ -29,9 +29,16 @@ export const userService = {
     return prisma.user.findUnique({ where: { telegramId } });
   },
 
+  /**
+   * Find a user by Telegram username.
+   * Normalizes input (strips leading @, trims) and matches case-insensitively
+   * so "@Alice", "alice" and "ALICE" all find the same user.
+   */
   async findByUsername(username: string) {
+    const normalized = String(username ?? "").replace(/^@+/, "").trim();
+    if (!normalized) return null;
     return prisma.user.findFirst({
-      where: { username: username.replace("@", "") },
+      where: { username: { equals: normalized, mode: "insensitive" } },
     });
   },
 

@@ -4,6 +4,7 @@ import { prisma } from "../lib/db.js";
 import { treasuryService } from "../services/treasuryService.js";
 import { notificationService } from "../services/notificationService.js";
 import { reconciliationService } from "../services/reconciliationService.js";
+import { esc } from "../lib/html.js";
 import Queue from "bull";
 import { redis as redisClient } from "../lib/redis.js";
 
@@ -165,7 +166,7 @@ async function processWithdrawal(job: WithdrawalJob) {
 
     await notificationService.notifyUser(
       userId,
-      `<b>WITHDRAWAL FAILED</b>\n\n${amount} ${asset} has been returned to your wallet.\nReason: ${e instanceof Error ? e.message : "Unknown"}`
+      `<b>WITHDRAWAL FAILED</b>\n\n${esc(amount)} ${esc(asset)} has been returned to your wallet.\nReason: ${esc(e instanceof Error ? e.message : "Unknown")}`
     );
 
     throw e;

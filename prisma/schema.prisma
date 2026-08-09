@@ -129,6 +129,7 @@ model User {
   adminActions        AdminAction[]
   withdrawalRequests  WithdrawalRequest[]
   blockchainDeposits  BlockchainDeposit[]
+  depositAddresses    DepositAddress[]
 
   @@map("users")
 }
@@ -234,6 +235,28 @@ model LedgerEntry {
   @@index([userId, createdAt])
   @@index([ledgerTxId])
   @@map("ledger_entries")
+}
+
+// ─── Deposit Addresses (per-user HD-wallet derived addresses) ────────────
+// Maps user -> deposit address per network/asset. Addresses are derived
+// deterministically from DEPOSIT_HD_MNEMONIC (BIP-44) and persisted so the
+// same address is reused for a user/network and so the blockchain monitor
+// can attribute a deposit by (network, asset, address) -> userId.
+
+model DepositAddress {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  network   String   @db.VarChar(20)
+  asset     String   @db.VarChar(10)
+  address   String   @db.VarChar(128)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([network, asset, address], name: "deposit_address_unique")
+  @@index([userId, network, asset])
+  @@index([network, asset, address])
+  @@map("deposit_addresses")
 }
 
 // ─── Blockchain Deposits (tracks on-chain deposits to user wallets) ──────

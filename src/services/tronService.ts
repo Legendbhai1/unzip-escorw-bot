@@ -104,9 +104,7 @@ export const tronService = {
     const rawAmount = BigInt(transfer.value);
     const amount = (Number(rawAmount) / Math.pow(10, decimals)).toFixed(decimals);
 
-    const confirmations = txBlockNumber && latestBlock > txBlockNumber
-      ? latestBlock - txBlockNumber
-      : 0;
+    const confirmations = txBlockNumber ? Math.max(0, latestBlock - txBlockNumber) : 0;
 
     return {
       txHash: transfer.transaction_id,
