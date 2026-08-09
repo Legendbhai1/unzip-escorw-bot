@@ -11,6 +11,54 @@ import type { DetectedTransaction } from "../types/index.js";
 
 const lastPollTimestamp = new Map<string, number>();
 
+// System user used to record deposits that cannot be attributed to a user
+// (e.g. static platform deposit address). Never credited automatically.
+const UNATTRIBUTED_USER_ID = "00000000-0000-0000-0000-000000000001";
+
+// Throttle identical monitor errors so a missing table / API outage does not
+// spam the logs on every poll. New/different errors still log immediately.
+let lastErrorKey = "";
+let lastErrorAt = 0;
+
+/**
+ * Ensure the unattributed system user exists (idempotent).
+ * Needed because blockchain_deposits.user_id has a foreign key to users(id).
+ */
+async function ensureUnattributedUser() {
+  try {
+    await prisma.user.upsert({
+      where: { id: UNATTRIBUTED_USER_ID },
+      create: {
+        id: UNATTRIBUTED_USER_ID,
+        telegramId: BigInt(0), // not a real Telegram account
+        username: "unattributed",
+        firstName: "Unattributed Deposit",
+        status: "ACTIVE",
+      },
+      update: {},
+    });
+  } catch (e) {
+    logger.warn({ err: e }, "Could not ensure unattributed system user");
+  }
+}
+
+/**
+ * Log a monitor error, throttling identical repeated messages to avoid spam
+ * (e.g. P2021 while tables are missing, or an RPC outage).
+ */
+function logMonitorError(err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err);
+  const now = Date.now();
+  const isRepeat = msg === lastErrorKey && now - lastErrorAt < 300_000;
+  if (isRepeat) {
+    logger.debug({ err }, "Blockchain monitor poll error (repeated, throttled)");
+    return;
+  }
+  lastErrorKey = msg;
+  lastErrorAt = now;
+  logger.error({ err }, "Blockchain monitor poll error");
+}
+
 /**
  * Blockchain Monitor detects incoming deposits and credits USER WALLETS.
  * Deposits are NOT deal-specific. They go to user available balance.
@@ -40,6 +88,9 @@ export const blockchainMonitor = {
       if (existing) {
         if (existing.status === "CONFIRMED") return null;
 
+        // Unattributed deposits can never be credited — skip silently
+        if (existing.userId === UNATTRIBUTED_USER_ID) return null;
+
         // Update confirmations for pending deposits
         if (confirmations >= existing.requiredConfs && existing.status === "PENDING") {
           return this.confirmAndCredit(existing.id, txHashLower, amount, network, fromAddress);
@@ -59,21 +110,38 @@ export const blockchainMonitor = {
 
     if (!userId) {
       // Record as pending — admin must attribute manually
-      await prisma.blockchainDeposit.create({
-        data: {
-          userId: "00000000-0000-0000-0000-000000000001", // unattributed
-          txHash: txHashLower,
-          logIndex,
-          fromAddress,
-          toAddress,
-          asset: "USDT",
-          network,
-          amount,
-          confirmations,
-          requiredConfs: this.getMinConfirmations(network),
-          status: "PENDING",
-        },
-      });
+      await ensureUnattributedUser();
+      try {
+        await prisma.blockchainDeposit.upsert({
+          where: {
+            blockchain_deposit_unique: {
+              network,
+              txHash: txHashLower,
+              logIndex,
+            },
+          },
+          create: {
+            userId: UNATTRIBUTED_USER_ID,
+            txHash: txHashLower,
+            logIndex,
+            fromAddress,
+            toAddress,
+            asset: "USDT",
+            network,
+            amount,
+            confirmations,
+            requiredConfs: this.getMinConfirmations(network),
+            status: "PENDING",
+          },
+          update: { confirmations, amount },
+        });
+      } catch (e) {
+        logger.warn(
+          { err: e, txHash: txHashLower, amount, network, toAddress },
+          "Could not record unattributed deposit"
+        );
+        return null;
+      }
       logger.warn(
         { txHash: txHashLower, amount, network, toAddress },
         "Deposit recorded as pending (user attribution needed)"
@@ -147,8 +215,8 @@ export const blockchainMonitor = {
   ) {
     const deposit = await prisma.blockchainDeposit.findUnique({ where: { id: depositId } });
     if (!deposit) return null;
-    if (deposit.userId === "00000000-0000-0000-0000-000000000001") {
-      logger.warn({ depositId }, "Cannot credit unattributed deposit");
+    if (deposit.userId === UNATTRIBUTED_USER_ID) {
+      logger.debug({ depositId }, "Skipping unattributed deposit");
       return null;
     }
 
@@ -235,13 +303,12 @@ export const blockchainMonitor = {
       for (const addr of addresses) {
         const transfers = await tronService.getTrc20Transfers(addr, undefined, minTs);
 
-        for (let i = 0; i < transfers.length; i++) {
-          const t = transfers[i];
-          // Attach logIndex for TRC20 (use index within batch as approximation)
-          const detected = {
-            ...tronService.parseTrc20Transfer(t, latestBlock),
-            logIndex: i, // TRC20 API doesn't give logIndex, use batch index
-          };
+        for (const t of transfers) {
+          // TRC20 API does not expose a log index — keep logIndex undefined so
+          // it defaults to 0. Using the batch position would make the dedup key
+          // (network, txHash, logIndex) unstable across polls and could cause
+          // duplicate credits for the same transaction.
+          const detected = tronService.parseTrc20Transfer(t, latestBlock);
           await this.processDeposit(detected);
         }
       }
@@ -294,7 +361,7 @@ export const blockchainMonitor = {
     });
 
     for (const dep of pending) {
-      if (dep.userId === "00000000-0000-0000-0000-000000000001") continue;
+      if (dep.userId === UNATTRIBUTED_USER_ID) continue;
 
       // Check current confirmations
       let currentConfs = dep.confirmations;
@@ -324,7 +391,7 @@ export const blockchainMonitor = {
         await this.pollBsc();
         await this.confirmPendingDeposits();
       } catch (e) {
-        logger.error({ err: e }, "Blockchain monitor poll error");
+        logMonitorError(e);
       }
     };
 

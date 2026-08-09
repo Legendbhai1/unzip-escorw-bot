@@ -298,9 +298,16 @@ export const treasuryService = {
     const idempotencyKey = `deposit:${network}:${txHash.toLowerCase()}:${logIndex}`;
 
     // Record blockchain deposit (separate from ledger)
-    // Use firstOrCreate since composite unique is at DB level
+    // Upsert on the composite unique (network, txHash, logIndex) so the
+    // same on-chain event can never create a duplicate tracking row.
     await prisma.blockchainDeposit.upsert({
-      where: { id: `placeholder_${txHash.toLowerCase()}_${logIndex}` },
+      where: {
+        blockchain_deposit_unique: {
+          network,
+          txHash: txHash.toLowerCase(),
+          logIndex,
+        },
+      },
       create: {
         userId,
         txHash: txHash.toLowerCase(),
@@ -331,7 +338,7 @@ export const treasuryService = {
         Array<{ userId: string; asset: string; available: string; locked: string }>
       >(
         Prisma.sql`SELECT user_id as "userId", asset, available, locked
-          FROM balances WHERE user_id = ${userId} AND asset = ${asset}
+          FROM balances WHERE user_id = ${userId}::uuid AND asset = ${asset}
           FOR UPDATE`
       );
 
@@ -661,7 +668,7 @@ export const treasuryService = {
         Array<{ userId: string; asset: string; available: string; locked: string }>
       >(
         Prisma.sql`SELECT user_id as "userId", asset, available, locked
-          FROM balances WHERE user_id = ${userId} AND asset = ${asset}
+          FROM balances WHERE user_id = ${userId}::uuid AND asset = ${asset}
           FOR UPDATE`
       );
 
@@ -745,7 +752,7 @@ export const treasuryService = {
         Array<{ userId: string; asset: string; available: string; locked: string }>
       >(
         Prisma.sql`SELECT user_id as "userId", asset, available, locked
-          FROM balances WHERE user_id = ${userId} AND asset = ${asset}
+          FROM balances WHERE user_id = ${userId}::uuid AND asset = ${asset}
           FOR UPDATE`
       );
 

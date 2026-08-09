@@ -55,7 +55,7 @@ export const dealService = {
     const deal = await prisma.$queryRaw<Array<{
       id: string; status: DealStatus; buyer_id: string;
     }>>(
-      Prisma.sql`SELECT id, status, buyer_id FROM deals WHERE id = ${dealId} FOR UPDATE`
+      Prisma.sql`SELECT id, status, buyer_id FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
 
     if (!deal[0]) throw new Error("Deal not found");
@@ -88,7 +88,7 @@ export const dealService = {
   ) {
     // SELECT ... FOR UPDATE to serialize concurrent access
     const result = await prisma.$queryRaw<Array<{ id: string; status: DealStatus }>>(
-      Prisma.sql`SELECT id, status FROM deals WHERE id = ${dealId} FOR UPDATE`
+      Prisma.sql`SELECT id, status FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
 
     if (!result[0]) throw new Error("Deal not found");
@@ -134,7 +134,7 @@ export const dealService = {
         buyer_fee_bps: number;
       }>>(
         Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, buyer_fee_bps
-          FROM deals WHERE id = ${dealId} FOR UPDATE`
+          FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
       );
 
       if (!dealRows[0]) throw new Error("Deal not found");
@@ -154,7 +154,7 @@ export const dealService = {
         userId: string; asset: string; available: string; locked: string;
       }>>(
         Prisma.sql`SELECT user_id as "userId", asset, available, locked
-          FROM balances WHERE user_id = ${d.buyer_id} AND asset = ${d.asset} FOR UPDATE`
+          FROM balances WHERE user_id = ${d.buyer_id}::uuid AND asset = ${d.asset} FOR UPDATE`
       );
 
       const available = balRows.length > 0 ? new Prisma.Decimal(balRows[0].available) : new Prisma.Decimal(0);
@@ -278,7 +278,7 @@ export const dealService = {
         seller_fee_bps: number;
       }>>(
         Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, seller_fee_bps
-          FROM deals WHERE id = ${dealId} FOR UPDATE`
+          FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
       );
 
       if (!dealRows[0]) throw new Error("Deal not found");
@@ -418,7 +418,7 @@ export const dealService = {
     const deal = await prisma.$queryRaw<Array<{
       id: string; status: DealStatus; buyer_id: string;
     }>>(
-      Prisma.sql`SELECT id, status, buyer_id FROM deals WHERE id = ${dealId} FOR UPDATE`
+      Prisma.sql`SELECT id, status, buyer_id FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
 
     if (!deal[0]) throw new Error("Deal not found");
@@ -461,7 +461,7 @@ export const dealService = {
       }>>(
         Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset,
           buyer_fee_bps, seller_fee_bps, buyer_fee_amount
-          FROM deals WHERE id = ${dealId} FOR UPDATE`
+          FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
       );
 
       if (!dealRows[0]) throw new Error("Deal not found");
@@ -491,7 +491,7 @@ export const dealService = {
         }>>(
           Prisma.sql`SELECT user_id as "userId", asset, available, locked
             FROM balances
-            WHERE (user_id = ${d.buyer_id} OR user_id = ${HOUSE_USER_ID})
+            WHERE (user_id = ${d.buyer_id}::uuid OR user_id = ${HOUSE_USER_ID}::uuid)
               AND asset = ${d.asset}
             FOR UPDATE`
         );
@@ -734,7 +734,7 @@ export const dealService = {
     const deal = await prisma.$queryRaw<Array<{
       id: string; status: DealStatus; buyer_id: string;
     }>>(
-      Prisma.sql`SELECT id, status, buyer_id as "buyerId" FROM deals WHERE id = ${dealId} FOR UPDATE`
+      Prisma.sql`SELECT id, status, buyer_id as "buyerId" FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
     if (!deal[0]) throw new Error("Deal not found");
     const d = deal[0];

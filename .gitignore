@@ -3,6 +3,5 @@ dist/
 .env
 *.log
 .DS_Store
-prisma/migrations/
 __pycache__/
 *.tsbuildinfo

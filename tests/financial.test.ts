@@ -86,7 +86,7 @@ describe("State Machine v2", () => {
 
   describe("terminal states block all transitions", () => {
     for (const state of [...TERMINAL_STATES] as any[]) {
-      it(`${state} should block all outgoing transitions", () => {
+      it(`${state} should block all outgoing transitions`, () => {
         expect(canTransition(state, "FUNDED", "BUYER")).toBeNull();
         expect(canTransition(state, "DISPUTED", "SELLER")).toBeNull();
         expect(canTransition(state, "JOINED", "SELLER")).toBeNull();
@@ -639,7 +639,7 @@ describe("Reconciliation", () => {
     await dealService.fund(DEAL_ID);
 
     await prisma.deal.update({ where: { id: DEAL_ID }, data: { status: "UNDER_REVIEW" } });
-    await prisma.dispute.create({ dealId: DEAL_ID, openedBy: BUYER_ID, reason: "test" });
+    await prisma.dispute.create({ data: { dealId: DEAL_ID, openedBy: BUYER_ID, reason: "test" } });
     await dealService.resolveDispute(DEAL_ID, HOUSE_USER_ID, "REFUND_BUYER", "reconcile test");
 
     const result = await reconciliationService.runFull();
@@ -725,7 +725,7 @@ describe("Fee Accounting", () => {
     await dealService.fund(DEAL_ID);
 
     await prisma.deal.update({ where: { id: DEAL_ID }, data: { status: "UNDER_REVIEW" } });
-    await prisma.dispute.create({ dealId: DEAL_ID, openedBy: BUYER_ID, reason: "test" });
+    await prisma.dispute.create({ data: { dealId: DEAL_ID, openedBy: BUYER_ID, reason: "test" } });
     await dealService.resolveDispute(DEAL_ID, HOUSE_USER_ID, "REFUND_BUYER", "policy test");
 
     const houseBal = await treasuryService.getBalance(HOUSE_USER_ID, ASSET);
