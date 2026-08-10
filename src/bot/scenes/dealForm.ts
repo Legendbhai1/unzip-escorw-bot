@@ -6,7 +6,7 @@ import { dealService } from "../../services/dealService.js";
 import { notificationService } from "../../services/notificationService.js";
 import { prisma } from "../../lib/db.js";
 import { logger } from "../../lib/logger.js";
-import { esc } from "../../lib/html.js";
+import { esc, userMention } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import {
   paymentMethodSelect, roleSelect, cryptoPayerSelect, categorySelect,
@@ -361,11 +361,12 @@ function groupStatusLabel(status: string): string {
 }
 
 /** Build the group-post deal card. The Telegram message itself is the deal
- *  reference — there are NO web links. */
+ *  reference — there are NO web links. Buyer/seller are rendered as clickable
+ *  tg://user mentions so they work in groups regardless of privacy mode. */
 export function buildDealCard(
   deal: any,
-  buyerUsername: string | null,
-  sellerUsername: string | null,
+  buyer: { username?: string | null; telegramId?: bigint | number | null } | null | undefined,
+  seller: { username?: string | null; telegramId?: bigint | number | null } | null | undefined,
   status?: string
 ): string {
   const isInr = (deal.asset ?? "") === "INR" || (deal.paymentMethod ?? "") === "INR";
@@ -379,8 +380,8 @@ export function buildDealCard(
 
   return (
     `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
-    `👤 Buyer: @${esc(buyerUsername ?? "N/A")}\n` +
-    `👤 Seller: @${esc(sellerUsername ?? "N/A")}\n\n` +
+    `👤 Buyer: ${userMention(buyer?.telegramId, buyer?.username)}\n` +
+    `👤 Seller: ${userMention(seller?.telegramId, seller?.username)}\n\n` +
     `💳 Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}</b>\n` +
     cryptoPayerLine +
     `💰 Amount: <b>${amountStr}</b>\n` +
@@ -463,19 +464,22 @@ export async function createDealFromForm(ctx: MyContext) {
 /** Post the completed deal card to the configured escrow group and remember
  *  the message (chat id + message id) on the deal so it can be updated as the
  *  deal progresses. The Telegram message itself is the deal reference — the
- *  bot never generates web links. */
+ *  bot never generates web links. The group id is the admin-entered
+ *  `escrow_group_id` setting (or the ESCROW_GROUP_ID env fallback). */
 export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSellerUsername?: string | null) {
-  const groupId = config.escrowGroupId.trim();
+  const { getEscrowGroupId } = await import("../../lib/paymentInstructions.js");
+  const groupId = (await getEscrowGroupId()).trim();
   if (!groupId) {
-    logger.info({ dealId: deal.id }, "ESCROW_GROUP_ID not configured — deal card not posted to a group");
+    logger.info({ dealId: deal.id }, "Escrow group not configured — deal card not posted to a group");
     return;
   }
 
   const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
-  // If the seller has joined, use their real username; otherwise show the
-  // intended seller from the form (buyer-created deals have no sellerId yet).
+  // If the seller has joined, use their real username; otherwise resolve the
+  // intended seller from the form (buyer-created deals have no sellerId yet)
+  // so the card shows a correct, clickable mention.
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
-  const sellerName = seller?.username ?? intendedSellerUsername ?? null;
+  const sellerResolved = seller ?? (intendedSellerUsername ? await userService.findByUsername(intendedSellerUsername) : null);
 
   const kb = new InlineKeyboard()
     .text("✅  Accept Deal", `admin:accept_deal:${deal.id}`)
@@ -484,7 +488,7 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSel
   try {
     const sent = await ctx.api.sendMessage(
       groupId,
-      buildDealCard(deal, buyer?.username ?? null, sellerName, "WAITING FOR ADMIN"),
+      buildDealCard(deal, buyer, sellerResolved, "WAITING FOR ADMIN"),
       { parse_mode: "HTML", reply_markup: kb }
     );
     await prisma.deal.update({
@@ -508,9 +512,14 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
   const status = groupStatusLabel(deal.status);
 
-  const acceptedByLine = deal.acceptedAt && deal.acceptedBy
-    ? `\nAccepted by: @${esc(deal.acceptedByUsername ?? "escrow admin")}`
-    : "";
+  const acceptedByUser = deal.acceptedAt && deal.acceptedBy
+    ? await userService.findById(deal.acceptedBy).catch(() => null)
+    : null;
+  const acceptedByLine = acceptedByUser
+    ? `\nAccepted by: ${userMention(acceptedByUser.telegramId, acceptedByUser.username)}`
+    : (deal.acceptedAt && deal.acceptedBy
+      ? `\nAccepted by: ${userMention(undefined, deal.acceptedByUsername ?? "escrow admin")}`
+      : "");
 
   const kb = new InlineKeyboard()
     .text("📋  View Status", `deal:status:${deal.id}`);
@@ -519,7 +528,7 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
     await ctx.api.editMessageText(
       deal.groupChatId,
       deal.groupMessageId,
-      buildDealCard(deal, buyer?.username ?? null, seller?.username ?? null, status + acceptedByLine),
+      buildDealCard(deal, buyer, seller, status + acceptedByLine),
       { parse_mode: "HTML", reply_markup: kb }
     );
   } catch (e) {

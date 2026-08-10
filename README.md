@@ -68,7 +68,7 @@ and personally pays the seller / refunds the buyer outside the bot.
 | `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `DATABASE_URL` | ✅ | PostgreSQL URL (Prisma migrations auto-apply on deploy) |
 | `ADMIN_TELEGRAM_IDS` | ✅ | Comma-separated admin/escrower Telegram IDs (only they can accept deals, verify payment, complete releases/refunds, resolve disputes, edit payment settings) |
-| `ESCROW_GROUP_ID` | ⚠️ | Chat id of the escrow group where deal cards are posted (required for the group flow) |
+| `ESCROW_GROUP_ID` | ⚠️ | Fallback chat id of the escrow group where deal cards are posted (required for the group flow). Can also be set at runtime via `/settings` → `escrow_group_id`, which takes precedence. |
 
 ## Payment settings (admin-entered, never generated)
 
@@ -86,6 +86,11 @@ used as a **fallback**:
 | `ESCROW_UPI_ID` | Escrower's UPI ID for INR deals |
 | `ESCROW_UPI_NAME` | Escrower's name shown for INR deals |
 | `ESCROW_CRYPTO_ADDRESS_USDT_BEP20` | Escrower's USDT BEP20 receive address |
+| `ESCROW_GROUP_ID` | Fallback escrow group chat id (see below) |
+
+The escrow group chat id is also an admin setting (`/settings` →
+`escrow_group_id`); the DB value overrides the env fallback, so the group can
+be re-pointed without redeploying.
 
 ## Flow
 
@@ -125,16 +130,26 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
 ## Telegram group setup (permissions)
 
 For the group flow to work, the escrow group should be configured via
-`ESCROW_GROUP_ID` and the bot added to it. Recommended permissions:
+`ESCROW_GROUP_ID` (or `/settings` → `escrow_group_id`) and the bot added to it.
+Recommended permissions:
 
-- **Add the bot as a group administrator** (or disable Privacy Mode) so the
-  bot reliably receives messages/callbacks in the group. Inline-button
-  callbacks on the bot's own deal card work regardless, but admin rights are
-  recommended for reliability and to allow `@`-tagging users.
+- **Add the bot as a group administrator** (or disable **Privacy Mode**) so the
+  bot reliably receives messages in the group. This matters for:
+  - `/form` and the word `form` in the group (the bot must see the message to
+    start the deal form there);
+  - `/release all`, `/release 50`, `/refund all`, `/refund 50` when sent as a
+    reply to a deal card in the group;
+  - making `@username` text into links (admin rights are required for Telegram
+    to render `@`-mentions; the bot's own deal card instead uses
+    `tg://user?id=…` links, which work without admin rights).
+- Inline-button callbacks on the bot's own deal card work regardless of admin
+  status, and sessions are keyed **per user** (not per chat), so members in the
+  same group never share form state or pending flows.
 - The bot posts the deal card itself, so it needs permission to **send
   messages** (and ideally to **edit messages**, which it has for its own
   messages).
-- Only admins from `ADMIN_TELEGRAM_IDS` can accept/cancel deals — the bot
+- Only admins from `ADMIN_TELEGRAM_IDS` can accept/cancel deals, verify
+  payments, complete releases/refunds and resolve disputes — the bot
   re-checks authorization server-side on every callback; a crafted callback
   from a non-admin is rejected.
 

@@ -5,7 +5,7 @@ import { config } from "../config/index.js";
 import { notificationService } from "../services/notificationService.js";
 import type { MyContext } from "./context.js";
 import { logger } from "../lib/logger.js";
-import { esc } from "../lib/html.js";
+import { esc, userMention } from "../lib/html.js";
 import { formatMoney, bpsToPercent } from "../lib/money.js";
 import { getPaymentInstructionsText, getAdminSetting, SETTING_KEYS } from "../lib/paymentInstructions.js";
 import { updateGroupDealCard } from "./scenes/dealForm.js";
@@ -150,8 +150,8 @@ async function listPendingPayments(ctx: MyContext) {
   for (const deal of deals) {
     const report = deal.paymentReports[0];
     const kb = new InlineKeyboard()
-      .text("\u{2705}  Verify Payment", `admin:verify_payment:${deal.id}`)
-      .text("\u{274C}  Reject Payment", `admin:reject_payment:${deal.id}`)
+      .text("\u{2705}  Payment Received", `admin:verify_payment:${deal.id}`)
+      .text("\u{274C}  Payment Not Received", `admin:reject_payment:${deal.id}`)
       .row()
       .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${deal.id}`);
 
@@ -275,7 +275,7 @@ export async function handleAdminCallback(ctx: MyContext) {
       {
         reply_markup: new InlineKeyboard()
           .text("\u{2705}  Confirm Verification", `admin:verify_confirm:${did}`)
-          .text("\u{274C}  Reject Payment", `admin:reject_payment:${did}`)
+          .text("\u{274C}  Payment Not Received", `admin:reject_payment:${did}`)
           .row()
           .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${did}`),
       }
@@ -676,15 +676,17 @@ function settingLabel(key: string): string {
     [SETTING_KEYS.upiId]: "UPI ID",
     [SETTING_KEYS.upiName]: "UPI name",
     [SETTING_KEYS.usdtBep20Address]: "USDT BEP20 receiving address",
+    [SETTING_KEYS.escrowGroupId]: "Escrow group chat id",
   };
   return map[key] ?? key;
 }
 
 async function showSettings(ctx: MyContext) {
-  const [upiId, upiName, usdt] = await Promise.all([
+  const [upiId, upiName, usdt, groupId] = await Promise.all([
     getAdminSetting(SETTING_KEYS.upiId),
     getAdminSetting(SETTING_KEYS.upiName),
     getAdminSetting(SETTING_KEYS.usdtBep20Address),
+    getAdminSetting(SETTING_KEYS.escrowGroupId),
   ]);
 
   await ctx.editMessageText(
@@ -696,6 +698,8 @@ async function showSettings(ctx: MyContext) {
     `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
     `🪙 <b>USDT BEP20</b>\n` +
     `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
+    `👥 <b>Escrow group</b>\n` +
+    `Chat id: <code>${esc(groupId || "— not set —")}</code> — new deal cards are posted here.\n\n` +
     `If a payment method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
     {
       reply_markup: new InlineKeyboard()
@@ -703,6 +707,8 @@ async function showSettings(ctx: MyContext) {
         .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
         .row()
         .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
+        .row()
+        .text("Set Escrow Group ID", `admin:settings:set:${SETTING_KEYS.escrowGroupId}`)
         .row()
         .text("\u{1F3E0}  Main Menu", "menu:main"),
     }
@@ -737,15 +743,20 @@ async function sendPaymentInstructionsToParties(ctx: MyContext, deal: any) {
   const totalPaid = parseFloat(deal.amount.toString()) + buyerFee;
   const amountStr = (deal.asset ?? "") === "INR" ? formatMoney(deal.amount.toString(), "INR") : formatMoney(deal.amount.toString(), deal.asset);
   const cryptoPayerLine = deal.paymentMethod !== "INR"
-    ? `Crypto payer: @${esc(payerUser?.username ?? "N/A")}\n`
+    ? `Crypto payer: ${userMention(payerUser?.telegramId, payerUser?.username)}\n`
     : "";
 
+  // The DM message tags the deal and the payer, and names both parties, so the
+  // payer always knows exactly which deal and which party they are paying for.
   const header =
     `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
     `🔐 <b>PAYMENT REQUIRED</b>\n\n` +
+    `Deal: #${esc(deal.inviteCode)}\n` +
+    `Buyer: ${userMention(buyer?.telegramId, buyer?.username)}\n` +
+    `Seller: ${userMention(seller?.telegramId, seller?.username)}\n` +
     `Payment method: <b>${deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20"}</b>\n` +
     cryptoPayerLine +
-    `Amount: <b>${amountStr}</b>\n` +
+    `Amount: <b>${amountStr}</b> + applicable buyer fee\n` +
     `Buyer fee: ${formatMoney(buyerFee, deal.asset === "INR" ? "INR" : deal.asset)} — total to pay: <b>${formatMoney(totalPaid, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
     `💳 <b>How to pay:</b>\n${instructions}\n\n` +
     `Payment is verified manually by the escrow admin. Only send money to the details above.`;

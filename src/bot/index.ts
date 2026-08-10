@@ -57,6 +57,16 @@ bot.use(session({
   initial: (): SessionData => ({
     userId: "", telegramId: 0, username: null, firstName: "",
   }),
+  // CRITICAL for group support: key sessions per-user (ctx.from.id), NOT
+  // per-chat. grammY's default getSessionKey is ctx.chatId, which in a shared
+  // escrow group would give every member the SAME session — colliding form
+  // state, lastDealId and pending flows between users and breaking inline
+  // callbacks. Keying by from.id isolates each user's flow in every chat.
+  getSessionKey: (ctx) => {
+    const fromId = ctx.from?.id;
+    if (fromId != null) return `u${fromId}`;
+    return ctx.chatId != null ? `c${ctx.chatId}` : undefined;
+  },
   storage: {
     async read(key: string) {
       const memory = memorySessionStore.get(key);
@@ -143,13 +153,12 @@ bot.command("start", async (ctx) => {
 });
 
 // ─── /form Command + "form" text (same canonical flow as the button) ──
-// The form collects deal details, so it only starts in a private chat.
+// The form collects deal details. It works in DM and in the escrow group
+// (subject to Telegram permissions — see the group setup section in README).
 bot.command("form", async (ctx) => {
-  if (ctx.chat?.type !== "private") return;
   await startDealForm(ctx);
 });
 bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
-  if (ctx.chat?.type !== "private") return;
   await startDealForm(ctx);
 });
 
@@ -587,8 +596,8 @@ async function completePaymentReport(
       `Payment: ${esc(deal?.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}\n` +
       `Reported by: @${esc(ctx.session.username ?? ctx.session.firstName)}${opts.reference ? `\nReference: <code>${esc(opts.reference)}</code>` : ""}${opts.evidence ? "\n📎 Screenshot attached" : ""}`,
       new InlineKeyboard()
-        .text("\u{2705}  Verify Payment", `admin:verify_payment:${dealId}`)
-        .text("\u{274C}  Reject Payment", `admin:reject_payment:${dealId}`)
+        .text("\u{2705}  Payment Received", `admin:verify_payment:${dealId}`)
+        .text("\u{274C}  Payment Not Received", `admin:reject_payment:${dealId}`)
         .row()
         .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${dealId}`)
     );
@@ -654,10 +663,11 @@ bot.command("admin", adminDashboard);
 async function adminPaymentSettings(ctx: MyContext) {
   const { prisma } = await import("../lib/db.js");
   const { getAdminSetting, SETTING_KEYS } = await import("../lib/paymentInstructions.js");
-  const [upiId, upiName, usdt] = await Promise.all([
+  const [upiId, upiName, usdt, groupId] = await Promise.all([
     getAdminSetting(SETTING_KEYS.upiId),
     getAdminSetting(SETTING_KEYS.upiName),
     getAdminSetting(SETTING_KEYS.usdtBep20Address),
+    getAdminSetting(SETTING_KEYS.escrowGroupId),
   ]);
 
   await ctx.reply(
@@ -668,6 +678,8 @@ async function adminPaymentSettings(ctx: MyContext) {
     `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
     `🪙 <b>USDT BEP20</b>\n` +
     `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
+    `👥 <b>Escrow group</b>\n` +
+    `Chat id: <code>${esc(groupId || "— not set —")}</code> — new deal cards are posted here.\n\n` +
     `If a method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
     {
       reply_markup: new InlineKeyboard()
@@ -675,6 +687,8 @@ async function adminPaymentSettings(ctx: MyContext) {
         .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
         .row()
         .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
+        .row()
+        .text("Set Escrow Group ID", `admin:settings:set:${SETTING_KEYS.escrowGroupId}`)
         .row()
         .text("\u{1F3E0}  Main Menu", "menu:main"),
     }
