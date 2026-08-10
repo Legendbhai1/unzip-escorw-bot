@@ -21,6 +21,8 @@ async function getBot() {
 export const notificationService = {
   /**
    * Notify a user that a new deal has been created involving them.
+   * There is NO web link — the deal message in the escrow group is the deal
+   * reference and the escrow admin accepts it there.
    */
   async notifyDealCreated(
     userId: string,
@@ -28,25 +30,28 @@ export const notificationService = {
     amount: string,
     asset: string,
     description: string,
-    paymentLabel?: string
+    paymentLabel?: string,
+    cryptoPayer?: string
   ) {
     try {
       const user = await prisma.user.findUnique({ where: { id: userId } });
       if (!user) return;
 
       const b = await getBot();
-      const botInfo = await b.api.getMe();
-      const link = `https://t.me/${botInfo.username}?start=deal_${inviteCode}`;
       const amountStr = asset === "INR" ? `${amount} INR` : `${amount} ${asset}`;
+      const cryptoPayerLine = cryptoPayer
+        ? `Crypto payer: <b>${esc(cryptoPayer === "SELLER" ? "Seller" : "Buyer")}</b>\n`
+        : "";
 
       await b.api.sendMessage(Number(user.telegramId),
         `<b>NEW ESCROW DEAL</b>\n\n` +
         `A deal has been created involving you:\n\n` +
-        `Payment: <b>${esc(paymentLabel ?? (asset === "INR" ? "INR / UPI" : "Crypto"))}</b>\n` +
+        `Payment: <b>${esc(paymentLabel ?? (asset === "INR" ? "INR / UPI" : "USDT BEP20"))}</b>\n` +
+        cryptoPayerLine +
         `Amount: <b>${esc(amountStr)}</b>\n` +
         `Item: ${esc(description.slice(0, 100))}\n\n` +
         `🔐 Payment is manually verified by the escrower.\n\n` +
-        `Tap below to review and accept:\n${esc(link)}`,
+        `The deal has been posted to the escrow group and is <b>waiting for the escrow admin to accept it</b>. You will receive payment instructions here once it is accepted.`,
         { parse_mode: "HTML" }
       );
     } catch (e) {

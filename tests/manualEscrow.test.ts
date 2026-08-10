@@ -14,6 +14,7 @@ const ADMIN_ID = "66666666-6666-6666-6666-666666666666";
 
 async function cleanAll() {
   await prisma.adminAction.deleteMany();
+  await prisma.adminSetting.deleteMany();
   await prisma.disputeEvidence.deleteMany();
   await prisma.dispute.deleteMany();
   await prisma.escrowAuditLog.deleteMany();
@@ -42,13 +43,15 @@ async function createDeal(method: "INR" | "CRYPTO", amount = "10000") {
   const isInr = method === "INR";
   return dealService.create({
     buyerUserId: BUYER_ID,
-    sellerUserId: null,
+    // Both parties are known at creation (both must have started the bot).
+    sellerUserId: SELLER_ID,
     sellerUsername: "seller_user",
     amount,
     asset: isInr ? "INR" : "USDT",
-    network: isInr ? "UPI" : "TRC20",
+    network: isInr ? "UPI" : "BEP20",
     paymentMethod: method,
     currency: isInr ? "INR" : "USDT",
+    cryptoPayer: method === "CRYPTO" ? "BUYER" : undefined,
     description: "Manual escrow test deal",
     category: "FREELANCE_SERVICES",
   });
@@ -93,12 +96,16 @@ describe("Manual deal creation", () => {
     expect(deal.sellerFeeBps).toBe(100);
   });
 
-  it("creates a crypto deal (paymentMethod=CRYPTO, USDT/TRC20 denomination)", async () => {
+  it("creates a crypto deal (paymentMethod=CRYPTO, USDT/BEP20 denomination, cryptoPayer stored)", async () => {
     const deal = await createDeal("CRYPTO", "100");
     expect(deal.paymentMethod).toBe("CRYPTO");
     expect(deal.currency).toBe("USDT");
     expect(deal.asset).toBe("USDT");
-    expect(deal.network).toBe("TRC20");
+    expect(deal.network).toBe("BEP20");
+    expect(deal.cryptoPayer).toBe("BUYER");
+    expect(deal.remainingAmount?.toString()).toBe("100");
+    const audit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "DEAL_CREATED" } });
+    expect(audit).not.toBeNull();
   });
 
   it("counterparty lookup normalizes @ + case-insensitive", async () => {
@@ -115,10 +122,10 @@ describe("Manual deal creation", () => {
 // PAYMENT INSTRUCTIONS (config-backed, never generated)
 // ═══════════════════════════════════════════════════════════════════
 
-describe("Payment instructions", () => {
-  it("returns configured UPI details for INR deals", () => {
-    const text = getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
-    if (config.escrow.upiId) {
+describe("Payment instructions (admin settings / env fallback, never generated)", () => {
+  it("returns configured UPI details for INR deals", async () => {
+    const text = await getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
+    if (config.escrow.upiId || config.escrow.upiName) {
       expect(text).toContain("UPI ID");
       expect(text).not.toContain("unavailable");
     } else {
@@ -126,26 +133,42 @@ describe("Payment instructions", () => {
     }
   });
 
-  it("returns configured escrower crypto address for USDT_TRC20", () => {
-    const text = getPaymentInstructionsText({ asset: "USDT", network: "TRC20", paymentMethod: "CRYPTO" });
-    if (config.escrow.cryptoAddresses["USDT_TRC20"]) {
-      expect(text).toContain(config.escrow.cryptoAddresses["USDT_TRC20"]);
+  it("returns the configured USDT BEP20 address (only supported crypto)", async () => {
+    const text = await getPaymentInstructionsText({ asset: "USDT", network: "BEP20", paymentMethod: "CRYPTO" });
+    if (config.escrow.cryptoAddresses["USDT_BEP20"]) {
+      expect(text).toContain(config.escrow.cryptoAddresses["USDT_BEP20"]);
+      expect(text).toContain("BEP20");
     } else {
       expect(text).toContain("unavailable");
     }
   });
 
-  it("never fabricates an address: unknown denomination -> unavailable", () => {
-    const text = getPaymentInstructionsText({ asset: "BTC", network: "LIGHTNING", paymentMethod: "CRYPTO" });
-    expect(text).toBe("Payment instructions are currently unavailable. Please contact the escrower.");
+  it("USDT on TRC20 is NOT supported -> unavailable", async () => {
+    const text = await getPaymentInstructionsText({ asset: "USDT", network: "TRC20", paymentMethod: "CRYPTO" });
+    expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
   });
 
-  it("INR with unconfigured UPI -> unavailable (no fabricated data)", () => {
+  it("never fabricates an address: unknown denomination -> unavailable", async () => {
+    const text = await getPaymentInstructionsText({ asset: "BTC", network: "LIGHTNING", paymentMethod: "CRYPTO" });
+    expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
+  });
+
+  it("DB admin settings override the env fallback", async () => {
+    await prisma.adminSetting.upsert({
+      where: { key: "upi_id" },
+      create: { key: "upi_id", value: "db-admin@upi.example", updatedBy: ADMIN_ID },
+      update: { value: "db-admin@upi.example" },
+    });
+    const text = await getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
+    expect(text).toContain("db-admin@upi.example");
+  });
+
+  it("INR with unconfigured UPI -> unavailable (no fabricated data)", async () => {
     const saved = (config as any).escrow;
     (config as any).escrow = { upiId: "", upiName: "", cryptoAddresses: {} };
     try {
-      const text = getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
-      expect(text).toBe("Payment instructions are currently unavailable. Please contact the escrower.");
+      const text = await getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
+      expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
     } finally {
       (config as any).escrow = saved;
     }
@@ -255,6 +278,12 @@ describe("Manual escrow full flow (INR)", () => {
     const releaseAudit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "RELEASE_REQUESTED" } });
     expect(releaseAudit).not.toBeNull();
 
+    // Release cannot be completed without the counterparty's agreement.
+    await expect(dealService.confirmManualRelease(deal.id, ADMIN_ID)).rejects.toThrow(/agreed/);
+    await dealService.agreeRelease(deal.id, SELLER_ID, true);
+    const agreeAudit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "RELEASE_AGREED" } });
+    expect(agreeAudit).not.toBeNull();
+
     const result = await dealService.confirmManualRelease(deal.id, ADMIN_ID, "PAYOUT-999");
     const done = await prisma.deal.findUnique({ where: { id: deal.id } });
 
@@ -341,10 +370,20 @@ describe("Manual escrow full flow (INR)", () => {
     expect(canTransition("PAYMENT_REPORTED", "FUNDED", "BUYER")).toBeNull();
     expect(canTransition("PAYMENT_REPORTED", "AWAITING_PAYMENT", "BUYER")).toBeNull();
 
-    // Only the buyer can request release.
+    // Only participants can request release (a non-participant cannot).
     await dealService.verifyPayment(deal.id, ADMIN_ID);
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
-    await expect(dealService.requestRelease(deal.id, SELLER_ID)).rejects.toThrow();
+    await expect(dealService.requestRelease(deal.id, ADMIN_ID)).rejects.toThrow();
+
+    // The counterparty cannot agree to their own request, and the escrower
+    // cannot release without agreement.
+    await dealService.requestRelease(deal.id, BUYER_ID);
+    await expect(dealService.agreeRelease(deal.id, BUYER_ID, true)).rejects.toThrow();
+    await expect(dealService.confirmManualRelease(deal.id, ADMIN_ID)).rejects.toThrow(/agreed/);
+    await dealService.agreeRelease(deal.id, SELLER_ID, true);
+    // The escrower cannot complete the release more than once (idempotent guard).
+    await dealService.confirmManualRelease(deal.id, ADMIN_ID);
+    await expect(dealService.confirmManualRelease(deal.id, ADMIN_ID)).rejects.toThrow();
 
     // Manual refund requires an UNDER_REVIEW deal + ADMIN.
     await expect(dealService.manualRefund(deal.id, ADMIN_ID, "nope")).rejects.toThrow();
@@ -367,6 +406,7 @@ describe("Fee calculation (INR example from spec)", () => {
 
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
     await dealService.requestRelease(deal.id, BUYER_ID);
+    await dealService.agreeRelease(deal.id, SELLER_ID, true);
     const release = await dealService.confirmManualRelease(deal.id, ADMIN_ID);
 
     expect(parseFloat(release.sellerPayout)).toBe(9900); // seller receives
@@ -394,8 +434,196 @@ describe("Fee calculation (INR example from spec)", () => {
     expect(DISPUTABLE_STATES.has("FUNDED")).toBe(true);
     expect(DISPUTABLE_STATES.has("DELIVERED")).toBe(true);
     expect(DISPUTABLE_STATES.has("RELEASE_REQUESTED")).toBe(true);
+    expect(DISPUTABLE_STATES.has("REFUND_REQUESTED")).toBe(true);
     expect(ACTIVE_STATES.has("AWAITING_PAYMENT")).toBe(true);
     expect(ACTIVE_STATES.has("PAYMENT_REPORTED")).toBe(true);
+    expect(ACTIVE_STATES.has("REFUND_REQUESTED")).toBe(true);
     expect(TERMINAL_STATES.has("COMPLETED")).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP DEAL: ADMIN ACCEPTANCE
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Admin acceptance (group deal card)", () => {
+  it("CREATED -> AWAITING_PAYMENT via adminAccept, records acceptedBy/At, rejects duplicates", async () => {
+    const deal = await createDeal("INR", "10000");
+    expect(deal.status).toBe("CREATED");
+
+    await dealService.adminAccept(deal.id, ADMIN_ID);
+    const accepted = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(accepted?.status).toBe("AWAITING_PAYMENT");
+    expect(accepted?.acceptedBy).toBe(ADMIN_ID);
+    expect(accepted?.acceptedAt).not.toBeNull();
+    expect(accepted?.expiresAt).not.toBeNull();
+
+    const audit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "ADMIN_ACCEPTED" } });
+    expect(audit).not.toBeNull();
+
+    // Duplicate acceptance is rejected.
+    await expect(dealService.adminAccept(deal.id, ADMIN_ID)).rejects.toThrow(/already been accepted/);
+  });
+
+  it("state machine allows CREATED -> AWAITING_PAYMENT only for ADMIN", () => {
+    expect(canTransition("CREATED", "AWAITING_PAYMENT", "ADMIN")).not.toBeNull();
+    expect(canTransition("CREATED", "AWAITING_PAYMENT", "BUYER")).toBeNull();
+    expect(canTransition("CREATED", "AWAITING_PAYMENT", "SELLER")).toBeNull();
+  });
+
+  it("admin can cancel a CREATED deal from the group (state machine + service)", async () => {
+    const deal = await createDeal("INR", "5000");
+    await dealService.cancel(deal.id, ADMIN_ID);
+    expect((await prisma.deal.findUnique({ where: { id: deal.id } }))?.status).toBe("CANCELLED");
+    expect(canTransition("CREATED", "CANCELLED", "ADMIN")).not.toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// CRYPTO PAYER (USDT deals)
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Crypto payer (USDT BEP20)", () => {
+  it("when the seller is the crypto payer, only the seller can report payment", async () => {
+    const deal = await dealService.create({
+      buyerUserId: BUYER_ID,
+      sellerUserId: SELLER_ID,
+      sellerUsername: "seller_user",
+      amount: "100",
+      asset: "USDT",
+      network: "BEP20",
+      paymentMethod: "CRYPTO",
+      currency: "USDT",
+      cryptoPayer: "SELLER",
+      description: "Seller pays USDT",
+      category: "FREELANCE_SERVICES",
+    });
+
+    await dealService.adminAccept(deal.id, ADMIN_ID);
+
+    // The buyer cannot report payment on a seller-pays deal.
+    await expect(dealService.reportPayment(deal.id, BUYER_ID, { reference: "X" })).rejects.toThrow(/payer/);
+
+    await dealService.reportPayment(deal.id, SELLER_ID, { reference: "TX-SELLER" });
+    const updated = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(updated?.status).toBe("PAYMENT_REPORTED");
+    expect(updated?.paymentReportedBy).toBe(SELLER_ID);
+
+    const report = await prisma.paymentReport.findFirst({ where: { dealId: deal.id } });
+    expect(report?.reportedBy).toBe(SELLER_ID);
+  });
+
+  it("payer resolution: INR always buyer, USDT honors cryptoPayer", () => {
+    const inr = { paymentMethod: "INR", buyerId: BUYER_ID, sellerId: SELLER_ID };
+    const usdtBuyer = { paymentMethod: "CRYPTO", cryptoPayer: "BUYER", buyerId: BUYER_ID, sellerId: SELLER_ID };
+    const usdtSeller = { paymentMethod: "CRYPTO", cryptoPayer: "SELLER", buyerId: BUYER_ID, sellerId: SELLER_ID };
+    expect(dealService.getPayerId(inr)).toBe(BUYER_ID);
+    expect(dealService.getPayerId(usdtBuyer)).toBe(BUYER_ID);
+    expect(dealService.getPayerId(usdtSeller)).toBe(SELLER_ID);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// PARTIAL RELEASE / REFUND (with counterparty agreement)
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Partial release & refund", () => {
+  async function fundedDeal(amount = "100") {
+    const deal = await createDeal("CRYPTO", amount);
+    await dealService.adminAccept(deal.id, ADMIN_ID);
+    await dealService.reportPayment(deal.id, BUYER_ID, {});
+    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    await dealService.transition(deal.id, "DELIVERED", "SELLER");
+    return deal;
+  }
+
+  it("/release 50 on a 100 deal: requests 50, keeps 50 remaining, deal not completed", async () => {
+    const deal = await fundedDeal("100");
+
+    await dealService.requestRelease(deal.id, BUYER_ID, "50");
+    const req = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(req?.status).toBe("RELEASE_REQUESTED");
+    expect(req?.releaseRequestedAmount?.toString()).toBe("50");
+    expect(req?.releaseRequestedBy).toBe(BUYER_ID);
+
+    // Amounts above the remaining are rejected.
+    await expect(dealService.requestRelease(deal.id, SELLER_ID, "0")).rejects.toThrow();
+
+    await dealService.agreeRelease(deal.id, SELLER_ID, true);
+    const result = await dealService.confirmManualRelease(deal.id, ADMIN_ID);
+
+    const after = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(after?.status).toBe("DELIVERED"); // partial — deal continues
+    expect(after?.releasedAmount?.toString()).toBe("50");
+    expect(after?.remainingAmount?.toString()).toBe("50");
+    expect(after?.releasedBy).toBe(ADMIN_ID);
+    // 50 - 1% seller fee = 49.5
+    expect(parseFloat(result.sellerPayout)).toBe(49.5);
+
+    const audit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "MANUAL_RELEASE_CONFIRMED" } });
+    expect(audit?.amount?.toString()).toBe("50");
+  });
+
+  it("/release all releases the full remaining and completes the deal", async () => {
+    const deal = await fundedDeal("100");
+    await dealService.requestRelease(deal.id, BUYER_ID); // no amount = all
+    await dealService.agreeRelease(deal.id, SELLER_ID, true);
+    const result = await dealService.confirmManualRelease(deal.id, ADMIN_ID);
+
+    const after = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(after?.status).toBe("COMPLETED");
+    expect(after?.remainingAmount?.toString()).toBe("0");
+    expect(parseFloat(result.sellerPayout)).toBe(99);
+  });
+
+  it("/refund 50 on a 100 deal: partial refund, deal returns to DELIVERED", async () => {
+    const deal = await fundedDeal("100");
+
+    await dealService.requestRefund(deal.id, BUYER_ID, "50");
+    const req = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(req?.status).toBe("REFUND_REQUESTED");
+    expect(req?.refundRequestedAmount?.toString()).toBe("50");
+    expect(req?.refundRequestedBy).toBe(BUYER_ID);
+    expect(canTransition("REFUND_REQUESTED", "DISPUTED", "BUYER")).not.toBeNull();
+
+    await dealService.agreeRefund(deal.id, SELLER_ID, true);
+    const refundAudit = await prisma.escrowAuditLog.findFirst({ where: { dealId: deal.id, action: "REFUND_AGREED" } });
+    expect(refundAudit).not.toBeNull();
+
+    const result = await dealService.completeManualRefund(deal.id, ADMIN_ID, "REF-50");
+    const after = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(after?.status).toBe("DELIVERED"); // partial — deal continues
+    expect(after?.refundedAmount?.toString()).toBe("50");
+    expect(after?.remainingAmount?.toString()).toBe("50");
+    expect(after?.refundedBy).toBe(ADMIN_ID);
+    expect(after?.refundReference).toBe("REF-50");
+    expect(result.complete).toBe(false);
+  });
+
+  it("/refund all completes to REFUNDED", async () => {
+    const deal = await fundedDeal("100");
+    await dealService.requestRefund(deal.id, BUYER_ID);
+    await dealService.agreeRefund(deal.id, SELLER_ID, true);
+    const result = await dealService.completeManualRefund(deal.id, ADMIN_ID);
+
+    const after = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(after?.status).toBe("REFUNDED");
+    expect(after?.refundedAmount?.toString()).toBe("100");
+    expect(after?.remainingAmount?.toString()).toBe("0");
+    expect(result.complete).toBe(true);
+  });
+
+  it("rejecting a release request reverts the deal and allows a new request", async () => {
+    const deal = await fundedDeal("100");
+    await dealService.requestRelease(deal.id, BUYER_ID, "50");
+    await dealService.agreeRelease(deal.id, SELLER_ID, false);
+
+    const reverted = await prisma.deal.findUnique({ where: { id: deal.id } });
+    expect(reverted?.status).toBe("DELIVERED");
+    expect(reverted?.releaseRequestedAt).toBeNull();
+
+    // A fresh request can be made after rejection.
+    await dealService.requestRelease(deal.id, BUYER_ID, "50");
+    expect((await prisma.deal.findUnique({ where: { id: deal.id } }))?.status).toBe("RELEASE_REQUESTED");
   });
 });

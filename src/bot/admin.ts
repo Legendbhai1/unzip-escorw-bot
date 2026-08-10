@@ -7,7 +7,9 @@ import type { MyContext } from "./context.js";
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
 import { formatMoney, bpsToPercent } from "../lib/money.js";
-import { getPaymentInstructionsText } from "../lib/paymentInstructions.js";
+import { getPaymentInstructionsText, getAdminSetting, SETTING_KEYS } from "../lib/paymentInstructions.js";
+import { updateGroupDealCard } from "./scenes/dealForm.js";
+import { userService } from "../services/userService.js";
 
 /**
  * Admin / Escrower panel.
@@ -41,6 +43,7 @@ export async function adminDashboard(ctx: MyContext) {
     .text("List Disputes", "admin:disputes")
     .row()
     .text("Stuck Deals", "admin:stuck")
+    .text("Payment Settings", "admin:settings")
     .row()
     .text("User Lookup", "admin:user_lookup_prompt");
 
@@ -176,6 +179,42 @@ export async function handleAdminCallback(ctx: MyContext) {
   const data = ctx.callbackQuery?.data;
   if (!data || !data.startsWith("admin:")) return;
 
+  // ── Payment settings (admin-entered escrow receiving details) ──
+  if (data === "admin:settings") {
+    await showSettings(ctx);
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  if (data.startsWith("admin:settings:set:")) {
+    const key = data.replace("admin:settings:set:", "");
+    ctx.session.pendingSettingKey = key;
+    await ctx.editMessageText(
+      `Enter the new value for <b>${esc(settingLabel(key))}</b>.\n\n` +
+      `Current: <code>${esc((await getAdminSetting(key)) || "— not set —")}</code>\n\n` +
+      `Send <code>/cancel</code> to abort.`
+    );
+    return;
+  }
+
+  // ── Admin accepts a deal from the group card ──────────────────
+  if (data.startsWith("admin:accept_deal:")) {
+    const did = data.split(":")[2];
+    await acceptDealFromGroup(ctx, did);
+    return;
+  }
+
+  // ── Admin completes a manually agreed release / refund ─────────
+  if (data.startsWith("admin:mark_release_complete:")) {
+    const did = data.split(":")[2];
+    await markReleaseComplete(ctx, did);
+    return;
+  }
+  if (data.startsWith("admin:mark_refund_complete:")) {
+    const did = data.split(":")[2];
+    await markRefundComplete(ctx, did);
+    return;
+  }
+
   if (data === "admin:disputes") {
     await listDisputes(ctx);
     await ctx.answerCallbackQuery();
@@ -220,14 +259,18 @@ export async function handleAdminCallback(ctx: MyContext) {
     if (!deal) return;
     const buyerFee = parseFloat(deal.amount.toString()) * deal.buyerFeeBps / 10000;
     const totalPaid = parseFloat(deal.amount.toString()) + buyerFee;
+    const payer = dealService.getPayerId(deal);
+    const payerIsBuyer = payer === deal.buyerId;
+    const payerUser = payerIsBuyer ? deal.buyer : deal.seller;
 
     await ctx.editMessageText(
       `<b>VERIFY PAYMENT — #${esc(deal.inviteCode)}</b>\n\n` +
-      `Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}</b>\n` +
+      `Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}</b>\n` +
+      (deal.paymentMethod !== "INR" ? `Crypto payer: @${esc(payerUser?.username ?? "N/A")}\n` : "") +
       `Deal amount: <b>${amountStr(deal)}</b>\n` +
       `Buyer fee (${bpsToPercent(deal.buyerFeeBps)}): ${formatMoney(buyerFee, deal.asset === "INR" ? "INR" : deal.asset)}\n` +
-      `Buyer should have paid total: <b>${formatMoney(totalPaid, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
-      `💳 Payment instructions sent to the buyer:\n${getPaymentInstructionsText(deal)}\n\n` +
+      `Payer should have paid total: <b>${formatMoney(totalPaid, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
+      `💳 Payment instructions sent to the payer:\n${await getPaymentInstructionsText(deal)}\n\n` +
       `Only confirm after you have <b>personally verified the payment outside the bot</b>.`,
       {
         reply_markup: new InlineKeyboard()
@@ -253,21 +296,30 @@ export async function handleAdminCallback(ctx: MyContext) {
       );
       ctx.session.pendingPaymentReferenceDealId = did;
 
-      // Notify both parties.
+      // Notify both users in DM: payment verified by escrow admin.
       if (deal) {
+        const verifiedMsg =
+          `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\n` +
+          `Payment verified by escrow admin.\n` +
+          `@${esc(deal.buyer?.username ?? "buyer")} and @${esc(deal.seller?.username ?? "seller")}, continue the deal here.`;
+
         if (deal.buyer?.telegramId) {
-          await ctx.api.sendMessage(Number(deal.buyer.telegramId),
-            `<b>PAYMENT VERIFIED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower has manually verified your payment. The deal is now <b>FUNDED</b>.`,
-            { parse_mode: "HTML" });
+          await ctx.api.sendMessage(Number(deal.buyer.telegramId), verifiedMsg, {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("\u{1F4CB}  View Deal", `deal:status:${did}`)
+              .text("\u{1F6A8}  Dispute", `deal:dispute:${did}`),
+          });
         }
         if (deal.seller?.telegramId) {
-          await ctx.api.sendMessage(Number(deal.seller.telegramId),
-            `<b>PAYMENT VERIFIED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower has manually verified the buyer's payment. You can now <b>deliver</b>.`,
-            {
-              parse_mode: "HTML",
-              reply_markup: new InlineKeyboard().text("Mark as Delivered", `deal:deliver:${did}`),
-            });
+          await ctx.api.sendMessage(Number(deal.seller.telegramId), verifiedMsg, {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("\u{1F4E6}  Mark as Delivered", `deal:deliver:${did}`)
+              .text("\u{1F6A8}  Dispute", `deal:dispute:${did}`),
+          });
         }
+        await updateGroupDealCard(ctx, deal);
       }
     } catch (e: unknown) {
       await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error");
@@ -308,16 +360,19 @@ export async function handleAdminCallback(ctx: MyContext) {
     const did = data.split(":")[2];
     const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
     if (!deal) return;
-    const sellerFee = parseFloat(deal.amount.toString()) * deal.sellerFeeBps / 10000;
-    const sellerPayout = parseFloat(deal.amount.toString()) - sellerFee;
+    const reqAmount = deal.releaseRequestedAmount ? parseFloat(deal.releaseRequestedAmount.toString()) : parseFloat(deal.amount.toString());
+    const sellerFee = reqAmount * deal.sellerFeeBps / 10000;
+    const sellerPayout = reqAmount - sellerFee;
+    const remaining = deal.remainingAmount ? parseFloat(deal.remainingAmount.toString()) : parseFloat(deal.amount.toString());
 
     await ctx.editMessageText(
       `<b>CONFIRM MANUAL RELEASE — #${esc(deal.inviteCode)}</b>\n\n` +
-      `Amount: <b>${amountStr(deal)}</b>\n` +
-      `Payment method: ${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}\n` +
+      `Release amount: <b>${formatMoney(reqAmount, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n` +
+      `Remaining after release: <b>${formatMoney(remaining - reqAmount, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n` +
+      `Payment method: ${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}\n` +
       `Seller: @${esc(deal.seller?.username ?? "N/A")}\n\n` +
       `Seller payout (${bpsToPercent(deal.sellerFeeBps)} fee): <b>${formatMoney(sellerPayout, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n` +
-      `Escrow fee total: <b>${formatMoney(sellerFee, deal.asset === "INR" ? "INR" : deal.asset)} (seller) + buyer fee</b>\n\n` +
+      `Seller fee: <b>${formatMoney(sellerFee, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
       `Only confirm after you have <b>actually paid the seller outside the bot</b>.`,
       {
         reply_markup: new InlineKeyboard()
@@ -334,25 +389,29 @@ export async function handleAdminCallback(ctx: MyContext) {
     try {
       const result = await dealService.confirmManualRelease(did, ctx.session.userId);
       const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
+      const remaining = deal?.remainingAmount ? parseFloat(deal.remainingAmount.toString()) : 0;
+      const complete = !deal || remaining <= 0;
       await ctx.editMessageText(
-        `<b>RELEASED</b>\n\nDeal #${esc(deal?.inviteCode ?? did)} is now <b>COMPLETED</b>.\n` +
-        `Seller payout: ${formatMoney(result.sellerPayout, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n` +
-        `Seller fee: ${formatMoney(result.sellerFee, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n\n` +
+        `<b>RELEASED</b>\n\nDeal #${esc(deal?.inviteCode ?? did)} ${complete ? "is now <b>COMPLETED</b>" : "— partial release recorded"}.\n` +
+        `Seller payout (this release): ${formatMoney(result.sellerPayout, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n` +
+        `Remaining: ${formatMoney(remaining, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n\n` +
         `Send the payout reference (optional) or <code>/skip</code>:`
       );
       ctx.session.pendingPayoutReferenceDealId = did;
 
       if (deal) {
+        const msg = complete
+          ? `<b>DEAL COMPLETED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower has released payment to the seller. Deal is <b>COMPLETED</b>. Thank you!`
+          : `<b>PARTIAL RELEASE</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower released ${formatMoney(parseFloat(result.sellerPayout) + parseFloat(result.sellerFee), deal.asset === "INR" ? "INR" : deal.asset)}. Remaining: ${formatMoney(remaining, deal.asset === "INR" ? "INR" : deal.asset)}.`;
         if (deal.buyer?.telegramId) {
-          await ctx.api.sendMessage(Number(deal.buyer.telegramId),
-            `<b>DEAL COMPLETED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower has released payment to the seller. Deal is <b>COMPLETED</b>. Thank you!`,
-            { parse_mode: "HTML" });
+          await ctx.api.sendMessage(Number(deal.buyer.telegramId), msg, { parse_mode: "HTML" });
         }
         if (deal.seller?.telegramId) {
           await ctx.api.sendMessage(Number(deal.seller.telegramId),
-            `<b>PAYOUT CONFIRMED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower paid you ${formatMoney(result.sellerPayout, deal.asset === "INR" ? "INR" : deal.asset)} (after ${bpsToPercent(deal.sellerFeeBps)} fee). Deal is <b>COMPLETED</b>.`,
+            `<b>PAYOUT CONFIRMED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower paid you ${formatMoney(result.sellerPayout, deal.asset === "INR" ? "INR" : deal.asset)} (after ${bpsToPercent(deal.sellerFeeBps)} fee). ${complete ? "Deal is <b>COMPLETED</b>." : `Remaining: ${formatMoney(remaining, deal.asset === "INR" ? "INR" : deal.asset)}.`}`,
             { parse_mode: "HTML" });
         }
+        await updateGroupDealCard(ctx, deal);
       }
     } catch (e: unknown) {
       await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error");
@@ -403,6 +462,9 @@ export async function handleAdminCallback(ctx: MyContext) {
     try {
       await dealService.manualReleaseForDispute(did, ctx.session.userId, "Admin resolved via panel (manual release)");
       const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
+      await prisma.escrowAuditLog.create({
+        data: { dealId: did, action: "DISPUTE_RESOLVED", userId: ctx.session.userId, notes: "Manual release to seller (dispute resolved)" },
+      });
       await ctx.editMessageText("<b>RESOLVED</b>\n\nManual release confirmed for deal " + did + ". Seller paid by escrower.");
       if (deal) {
         for (const party of [deal.buyer, deal.seller]) {
@@ -412,6 +474,7 @@ export async function handleAdminCallback(ctx: MyContext) {
               { parse_mode: "HTML" });
           }
         }
+        await updateGroupDealCard(ctx, deal);
       }
     } catch (e: unknown) {
       await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error");
@@ -442,6 +505,9 @@ export async function handleAdminCallback(ctx: MyContext) {
     try {
       await dealService.manualRefund(did, ctx.session.userId, "Admin resolved via panel (manual refund)");
       const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
+      await prisma.escrowAuditLog.create({
+        data: { dealId: did, action: "DISPUTE_RESOLVED", userId: ctx.session.userId, notes: "Manual refund to buyer (dispute resolved)" },
+      });
       await ctx.editMessageText("<b>RESOLVED</b>\n\nManual refund confirmed for deal " + did + ". Buyer refunded by escrower.");
       if (deal) {
         for (const party of [deal.buyer, deal.seller]) {
@@ -451,6 +517,7 @@ export async function handleAdminCallback(ctx: MyContext) {
               { parse_mode: "HTML" });
           }
         }
+        await updateGroupDealCard(ctx, deal);
       }
     } catch (e: unknown) {
       await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error");
@@ -598,4 +665,207 @@ export async function lookupUser(ctx: MyContext) {
     "Joined: " + user.createdAt.toISOString().slice(0, 10);
 
   await ctx.reply(profileText, { reply_markup: kb });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAYMENT SETTINGS (admin-entered escrow receiving details)
+// ═══════════════════════════════════════════════════════════════════
+
+function settingLabel(key: string): string {
+  const map: Record<string, string> = {
+    [SETTING_KEYS.upiId]: "UPI ID",
+    [SETTING_KEYS.upiName]: "UPI name",
+    [SETTING_KEYS.usdtBep20Address]: "USDT BEP20 receiving address",
+  };
+  return map[key] ?? key;
+}
+
+async function showSettings(ctx: MyContext) {
+  const [upiId, upiName, usdt] = await Promise.all([
+    getAdminSetting(SETTING_KEYS.upiId),
+    getAdminSetting(SETTING_KEYS.upiName),
+    getAdminSetting(SETTING_KEYS.usdtBep20Address),
+  ]);
+
+  await ctx.editMessageText(
+    "<b>PAYMENT SETTINGS</b>\n\n" +
+    "These are the escrower's own receiving details — manually entered here, " +
+    "never generated by the bot. Only authorized admins can change them.\n\n" +
+    `💰 <b>INR / UPI</b>\n` +
+    `UPI ID: <code>${esc(upiId || "— not set —")}</code>\n` +
+    `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
+    `🪙 <b>USDT BEP20</b>\n` +
+    `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
+    `If a payment method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("Set UPI ID", `admin:settings:set:${SETTING_KEYS.upiId}`)
+        .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
+        .row()
+        .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
+        .row()
+        .text("\u{1F3E0}  Main Menu", "menu:main"),
+    }
+  );
+}
+
+/** Persist an admin-entered setting (called from the text message handler). */
+export async function setSettingValue(key: string, value: string, adminUserId: string) {
+  const clean = value.trim();
+  await prisma.adminSetting.upsert({
+    where: { key },
+    create: { key, value: clean, updatedBy: adminUserId },
+    update: { value: clean, updatedBy: adminUserId },
+  });
+  logger.info({ key, adminUserId }, "Admin payment setting updated");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP DEAL ACCEPTANCE + PAYMENT INSTRUCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+/** Send the payment-required message + instructions to both parties. */
+async function sendPaymentInstructionsToParties(ctx: MyContext, deal: any) {
+  const buyer = deal.buyer;
+  const seller = deal.seller;
+  const payerId = dealService.getPayerId(deal);
+  const payerIsBuyer = payerId === deal.buyerId;
+  const payerUser = payerIsBuyer ? buyer : seller;
+
+  const instructions = await getPaymentInstructionsText(deal);
+  const buyerFee = parseFloat(deal.amount.toString()) * deal.buyerFeeBps / 10000;
+  const totalPaid = parseFloat(deal.amount.toString()) + buyerFee;
+  const amountStr = (deal.asset ?? "") === "INR" ? formatMoney(deal.amount.toString(), "INR") : formatMoney(deal.amount.toString(), deal.asset);
+  const cryptoPayerLine = deal.paymentMethod !== "INR"
+    ? `Crypto payer: @${esc(payerUser?.username ?? "N/A")}\n`
+    : "";
+
+  const header =
+    `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
+    `🔐 <b>PAYMENT REQUIRED</b>\n\n` +
+    `Payment method: <b>${deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20"}</b>\n` +
+    cryptoPayerLine +
+    `Amount: <b>${amountStr}</b>\n` +
+    `Buyer fee: ${formatMoney(buyerFee, deal.asset === "INR" ? "INR" : deal.asset)} — total to pay: <b>${formatMoney(totalPaid, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
+    `💳 <b>How to pay:</b>\n${instructions}\n\n` +
+    `Payment is verified manually by the escrow admin. Only send money to the details above.`;
+
+  for (const [user, isPayer] of [[buyer, payerIsBuyer], [seller, !payerIsBuyer]] as const) {
+    if (!user?.telegramId) continue;
+    const kb = new InlineKeyboard();
+    if (isPayer) {
+      kb.text("\u{2705}  Payment Sent / Check Payment", `deal:paid:${deal.id}`);
+    } else {
+      kb.text("\u{1F4CB}  View Deal", `deal:status:${deal.id}`);
+    }
+    kb.row().text("\u{1F3E0}  Main Menu", "menu:main");
+    try {
+      await ctx.api.sendMessage(Number(user.telegramId), header, { parse_mode: "HTML", reply_markup: kb });
+    } catch (_e) { /* user may have blocked the bot */ }
+  }
+
+  await prisma.deal.update({
+    where: { id: deal.id },
+    data: { paymentInstructionsSentAt: new Date() },
+  });
+  await prisma.escrowAuditLog.create({
+    data: {
+      dealId: deal.id, action: "PAYMENT_INSTRUCTIONS_SENT",
+      notes: `Payment instructions sent (payer: @${payerUser?.username ?? "N/A"})`,
+    },
+  });
+}
+
+/** Escrow admin accepts a deal from the group card (admin-only, server-side). */
+async function acceptDealFromGroup(ctx: MyContext, dealId: string) {
+  try {
+    const deal = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
+    if (!deal) {
+      await ctx.answerCallbackQuery("Deal not found.").catch(() => {});
+      return;
+    }
+    if (deal.acceptedAt) {
+      const accepter = deal.acceptedBy ? await userService.findById(deal.acceptedBy) : null;
+      await ctx.answerCallbackQuery(`Already accepted by @${accepter?.username ?? "an admin"}.`);
+      return;
+    }
+
+    await dealService.adminAccept(dealId, ctx.session.userId);
+    await ctx.answerCallbackQuery("Deal accepted \u2705").catch(() => {});
+
+    const updated = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
+    if (updated) {
+      await sendPaymentInstructionsToParties(ctx, updated);
+      await updateGroupDealCard(ctx, {
+        ...updated,
+        acceptedByUsername: ctx.session.username ?? ctx.session.firstName,
+      });
+    }
+  } catch (e: unknown) {
+    await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});
+  }
+}
+
+/** Escrow admin marks a manually agreed release as completed. */
+async function markReleaseComplete(ctx: MyContext, dealId: string) {
+  try {
+    const result = await dealService.confirmManualRelease(dealId, ctx.session.userId);
+    const deal = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
+    const remaining = deal?.remainingAmount ? parseFloat(deal.remainingAmount.toString()) : 0;
+    const complete = !deal || remaining <= 0;
+
+    await ctx.editMessageText(
+      `<b>RELEASE COMPLETED</b>\n\nDeal #${esc(deal?.inviteCode ?? dealId)} ${complete ? "is now <b>COMPLETED</b>" : "— partial release recorded"}.\n` +
+      `Seller payout (this release): ${formatMoney(result.sellerPayout, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n` +
+      `Remaining: ${formatMoney(remaining, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n\n` +
+      `Send the payout reference (optional) or <code>/skip</code>:`
+    );
+    ctx.session.pendingPayoutReferenceDealId = dealId;
+
+    if (deal) {
+      const msg = complete
+        ? `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\nThe escrower has released payment to the seller. Deal is <b>COMPLETED</b>.`
+        : `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\nPartial release recorded. Remaining: ${formatMoney(remaining, deal.asset === "INR" ? "INR" : deal.asset)}.`;
+      for (const party of [deal.buyer, deal.seller]) {
+        if (party?.telegramId) {
+          await ctx.api.sendMessage(Number(party.telegramId), msg, { parse_mode: "HTML" });
+        }
+      }
+      await updateGroupDealCard(ctx, deal);
+    }
+  } catch (e: unknown) {
+    await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});
+  }
+}
+
+/** Escrow admin marks a manually agreed refund as completed. */
+async function markRefundComplete(ctx: MyContext, dealId: string) {
+  try {
+    const result = await dealService.completeManualRefund(dealId, ctx.session.userId);
+    const deal = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
+    const remaining = deal?.remainingAmount ? parseFloat(deal.remainingAmount.toString()) : 0;
+    const complete = !deal || remaining <= 0;
+
+    await ctx.editMessageText(
+      `<b>REFUND COMPLETED</b>\n\nDeal #${esc(deal?.inviteCode ?? dealId)} ${complete ? "is now <b>REFUNDED</b>" : "— partial refund recorded"}.\n` +
+      `Refunded (this): ${formatMoney(parseFloat(result.refundAmount), deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n` +
+      `Remaining: ${formatMoney(remaining, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n\n` +
+      `Send the refund reference (optional) or <code>/skip</code>:`
+    );
+    ctx.session.pendingRefundReferenceDealId = dealId;
+
+    if (deal) {
+      const msg = complete
+        ? `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\nThe escrower has refunded the buyer. Deal is <b>REFUNDED</b>.`
+        : `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\nPartial refund recorded. Remaining: ${formatMoney(remaining, deal.asset === "INR" ? "INR" : deal.asset)}.`;
+      for (const party of [deal.buyer, deal.seller]) {
+        if (party?.telegramId) {
+          await ctx.api.sendMessage(Number(party.telegramId), msg, { parse_mode: "HTML" });
+        }
+      }
+      await updateGroupDealCard(ctx, deal);
+    }
+  } catch (e: unknown) {
+    await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});
+  }
 }

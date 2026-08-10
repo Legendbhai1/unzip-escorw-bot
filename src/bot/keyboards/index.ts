@@ -10,11 +10,11 @@ export const mainMenu = new InlineKeyboard()
   .text("\u{1F4D6}  How It Works", "menu:how_it_works")
   .text("\u{1F198}  Support", "menu:support");
 
-// ── Payment Method Selection ───────────────────────────────────
+// ── Payment Method Selection (only these two methods are supported) ──
 export const paymentMethodSelect = new InlineKeyboard()
   .text("\u{1F4B3}  INR / UPI", "form:payment:INR")
   .row()
-  .text("\u{1FA99}  Crypto", "form:payment:CRYPTO")
+  .text("\u{1FA99}  USDT (BEP20)", "form:payment:USDT")
   .row()
   .text("\u{274C}  Cancel", "menu:main");
 
@@ -26,18 +26,13 @@ export const roleSelect = new InlineKeyboard()
   .row()
   .text("\u{274C}  Cancel", "menu:main");
 
-// ── Crypto Denomination Selection (payment method ONLY) ────────
-// Crypto here is just the payment denomination — the bot NEVER generates a
-// deposit address or monitors the blockchain.
-export const cryptoDenominationSelect = new InlineKeyboard()
-  .text("USDT (TRC20)", "form:asset:USDT_TRC20")
-  .text("USDT (BEP20)", "form:asset:USDT_BEP20")
+// ── Crypto payer selection (USDT deals only) ───────────────────
+// The bot only RECORDS who pays — the escrower manually receives and
+// verifies the USDT outside the bot.
+export const cryptoPayerSelect = new InlineKeyboard()
+  .text("\u{1F6D2}  Buyer pays", "form:crypto_payer:BUYER")
   .row()
-  .text("USDC (TRC20)", "form:asset:USDC_TRC20")
-  .text("BTC", "form:asset:BTC")
-  .row()
-  .text("LTC", "form:asset:LTC")
-  .text("TON", "form:asset:TON")
+  .text("\u{1F4BC}  Seller pays", "form:crypto_payer:SELLER")
   .row()
   .text("\u{274C}  Cancel", "menu:main");
 
@@ -95,8 +90,8 @@ export function dealActions(dealId: string, status: string) {
     k.text("\u{2705}  Accept & Release", `deal:release:${dealId}`)
       .row()
       .text("\u{1F6A8}  Open Dispute", `deal:dispute:${dealId}`);
-  } else if (status === "RELEASE_REQUESTED") {
-    k.text("\u{23F3}  Release Pending (Escrower)", `deal:status:${dealId}`)
+  } else if (status === "RELEASE_REQUESTED" || status === "REFUND_REQUESTED") {
+    k.text("\u{23F3}  Awaiting Counterparty / Escrower", `deal:status:${dealId}`)
       .row()
       .text("\u{1F6A8}  Open Dispute", `deal:dispute:${dealId}`);
   } else if (status === "DISPUTED" || status === "UNDER_REVIEW") {

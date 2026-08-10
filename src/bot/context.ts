@@ -17,8 +17,18 @@ export interface SessionData {
   createDealAmount?: string;
   createDealAsset?: string;
   createDealNetwork?: string;
+  createDealCryptoPayer?: "BUYER" | "SELLER";
   createDealDescription?: string;
   createDealCategory?: string;
+
+  // Last deal this user viewed/interacted with — used to resolve /release
+  // and /refund in DM when no deal message is replied to.
+  lastDealId?: string;
+
+  // Admin: which payment setting is being edited (upi_id / upi_name / …)
+  pendingSettingKey?: string;
+  // Admin: capturing an optional refund reference after marking refunded
+  pendingRefundReferenceDealId?: string;
 
   // ── Manual payment flow state ──
   // Buyer: awaiting payment reference / evidence after clicking "I've Paid"

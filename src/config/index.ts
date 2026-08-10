@@ -93,8 +93,8 @@ export const config = {
   escrow: {
     upiId: process.env.ESCROW_UPI_ID ?? "",
     upiName: process.env.ESCROW_UPI_NAME ?? "",
+    // Only USDT on BEP20 is supported. No other network/asset is accepted.
     cryptoAddresses: {
-      "USDT_TRC20": process.env.ESCROW_CRYPTO_ADDRESS_USDT_TRC20 ?? "",
       "USDT_BEP20": process.env.ESCROW_CRYPTO_ADDRESS_USDT_BEP20 ?? "",
     } as Record<string, string>,
   },

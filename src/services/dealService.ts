@@ -35,10 +35,11 @@ export const dealService = {
     network: string;
     paymentMethod: "INR" | "CRYPTO";
     currency?: string;
+    cryptoPayer?: "BUYER" | "SELLER";
     description: string;
     category: DealCategory;
   }) {
-    return prisma.deal.create({
+    const deal = await prisma.deal.create({
       data: {
         inviteCode: generateInviteCode(),
         buyerId: input.buyerUserId,
@@ -47,13 +48,75 @@ export const dealService = {
         network: input.network,
         amount: input.amount,
         paymentMethod: input.paymentMethod as PaymentMethod,
+        cryptoPayer: input.cryptoPayer ?? (input.paymentMethod === "CRYPTO" ? "BUYER" : null),
         currency: input.currency ?? input.asset,
         buyerFeeBps: config.buyerFeeBps,
         sellerFeeBps: config.sellerFeeBps,
         description: input.description,
         category: input.category,
         status: "CREATED",
+        remainingAmount: input.amount,
       },
+    });
+
+    try {
+      await prisma.escrowAuditLog.create({
+        data: {
+          dealId: deal.id, action: "DEAL_CREATED", userId: input.buyerUserId,
+          amount: input.amount, currency: input.currency ?? input.asset,
+          notes: `Deal created (${input.paymentMethod}${input.cryptoPayer ? `, crypto payer ${input.cryptoPayer}` : ""})`,
+        },
+      });
+    } catch (e) {
+      logger.warn({ dealId: deal.id, err: e }, "Failed to record DEAL_CREATED audit");
+    }
+
+    return deal;
+  },
+
+  /**
+   * The party who must pay the escrower: INR deals are always paid by the
+   * buyer; USDT deals are paid by the configured crypto payer (cryptoPayer).
+   * Handles both Prisma rows (camelCase) and raw rows (snake_case).
+   */
+  getPayerId(d: any): string {
+    const buyerId = d.buyerId ?? d.buyer_id;
+    const sellerId = d.sellerId ?? d.seller_id;
+    const method = String(d.paymentMethod ?? d.payment_method ?? "").toUpperCase();
+    const payer = String(d.cryptoPayer ?? d.crypto_payer ?? "").toUpperCase();
+    if (method !== "INR" && payer === "SELLER") return sellerId ?? buyerId;
+    return buyerId;
+  },
+
+  /**
+   * Escrow admin accepts a created deal from the group card.
+   * Deal -> AWAITING_PAYMENT. Records acceptedBy/acceptedAt and rejects
+   * duplicate acceptance.
+   */
+  async adminAccept(dealId: string, adminUserId: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.accepted_at) throw new Error("This deal has already been accepted");
+      const t = canTransition(d.status, "AWAITING_PAYMENT", "ADMIN");
+      if (!t) throw new Error(`Cannot accept deal from ${d.status}`);
+
+      const expiryMs = config.dealFundingExpiryMs;
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "AWAITING_PAYMENT",
+          acceptedBy: adminUserId,
+          acceptedAt: new Date(),
+          expiresAt: new Date(Date.now() + expiryMs),
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: { dealId, action: "ADMIN_ACCEPTED", userId: adminUserId, notes: "Escrow admin accepted the deal from the group card" },
+      });
+
+      logger.info({ dealId, adminUserId }, "Deal accepted by admin -> AWAITING_PAYMENT");
+      return { dealId };
     });
   },
 
@@ -97,7 +160,13 @@ export const dealService = {
   async _lockDeal(tx: Prisma.TransactionClient, dealId: string) {
     const rows = await tx.$queryRaw<Array<any>>(
       Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, network,
-        currency, payment_method, buyer_fee_bps, seller_fee_bps, buyer_fee_amount
+        currency, payment_method, crypto_payer, buyer_fee_bps, seller_fee_bps,
+        buyer_fee_amount, seller_fee_amount, accepted_at,
+        released_amount, refunded_amount, remaining_amount,
+        release_requested_by, release_requested_amount, release_requested_from,
+        release_agreed_by, release_agreed_at,
+        refund_requested_by, refund_requested_amount, refund_requested_from,
+        refund_agreed_by, refund_agreed_at
         FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
     if (!rows[0]) throw new Error("Deal not found");
@@ -117,8 +186,12 @@ export const dealService = {
   ) {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
-      if (d.buyer_id !== buyerUserId) throw new Error("Only the buyer can report payment");
-      const t = canTransition(d.status, "PAYMENT_REPORTED", "BUYER");
+      // Only the party who must pay the escrower can report payment
+      // (INR: buyer; USDT: the configured crypto payer).
+      const payerId = this.getPayerId(d);
+      if (payerId !== buyerUserId) throw new Error("Only the payer can report payment");
+      const payerRole = payerId === d.buyer_id ? "BUYER" : "SELLER";
+      const t = canTransition(d.status, "PAYMENT_REPORTED", payerRole);
       if (!t) throw new Error(`Cannot report payment from ${d.status}`);
 
       const report = await tx.paymentReport.create({
@@ -261,77 +334,178 @@ export const dealService = {
   },
 
   /**
-   * Buyer accepts delivery -> RELEASE_REQUESTED. The escrower then pays the
-   * seller manually and confirms the release (confirmManualRelease).
+   * A participant requests a release of the escrow (partial or full). The
+   * counterparty must agree (agreeRelease) before the escrower can act.
+   * Never releases anything automatically — the escrower pays manually.
+   *
+   * amount: optional partial amount ("50"). Omitted = the full remaining.
    */
-  async requestRelease(dealId: string, buyerUserId: string) {
+  async requestRelease(dealId: string, userId: string, amount?: string) {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
-      if (d.buyer_id !== buyerUserId) throw new Error("Only the buyer can accept delivery");
-      const t = canTransition(d.status, "RELEASE_REQUESTED", "BUYER");
+      if (d.buyer_id !== userId && d.seller_id !== userId) throw new Error("Only a participant can request release");
+      const role = d.buyer_id === userId ? "BUYER" : "SELLER";
+      const t = canTransition(d.status, "RELEASE_REQUESTED", role);
       if (!t) throw new Error(`Cannot request release from ${d.status}`);
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const released = new Prisma.Decimal(d.released_amount ?? "0");
+      const refunded = new Prisma.Decimal(d.refunded_amount ?? "0");
+      const remaining = dealAmount.sub(released).sub(refunded);
+      if (remaining.lte(0)) throw new Error("Nothing left to release");
+
+      const reqAmount = amount ? new Prisma.Decimal(amount) : remaining;
+      if (reqAmount.lte(0)) throw new Error("Release amount must be positive");
+      if (reqAmount.gt(remaining)) throw new Error(`Release amount exceeds the remaining amount (${remaining.toString()})`);
 
       await tx.deal.update({
         where: { id: dealId },
-        data: { status: "RELEASE_REQUESTED", releaseRequestedAt: new Date() },
+        data: {
+          status: "RELEASE_REQUESTED",
+          releaseRequestedAt: new Date(),
+          releaseRequestedBy: userId,
+          releaseRequestedAmount: reqAmount,
+          releaseRequestedFrom: d.status,
+          releaseAgreedBy: null,
+          releaseAgreedAt: null,
+        },
       });
 
       await tx.escrowAuditLog.create({
         data: {
-          dealId, action: "RELEASE_REQUESTED", userId: buyerUserId,
-          amount: d.amount, currency: d.currency ?? d.asset,
-          notes: "Buyer accepted delivery; escrower must pay seller manually",
+          dealId, action: "RELEASE_REQUESTED", userId,
+          amount: reqAmount, currency: d.currency ?? d.asset,
+          notes: amount
+            ? `Release request (${reqAmount.toString()}) — awaiting counterparty agreement`
+            : `Release request (all, ${reqAmount.toString()}) — awaiting counterparty agreement`,
         },
       });
 
-      logger.info({ dealId, buyerUserId }, "Release requested (awaiting manual escrower payout)");
+      logger.info({ dealId, userId, amount: reqAmount.toString() }, "Release requested — awaiting counterparty agreement");
+      return { requestedAmount: reqAmount.toString(), remaining: remaining.toString() };
+    });
+  },
+
+  /**
+   * The counterparty agrees to (or rejects) a pending release request.
+   * Only after agreement is the escrower notified and able to complete it.
+   */
+  async agreeRelease(dealId: string, userId: string, agree: boolean) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.status !== "RELEASE_REQUESTED") throw new Error(`Cannot respond from ${d.status}`);
+      if (d.release_requested_by === userId) throw new Error("You cannot respond to your own release request");
+      if (d.buyer_id !== userId && d.seller_id !== userId) throw new Error("Only a participant can respond");
+
+      if (!agree) {
+        const backTo = d.release_requested_from === "FUNDED" ? "FUNDED" : "DELIVERED";
+        const t = canTransition("RELEASE_REQUESTED", backTo, "ADMIN");
+        if (!t) throw new Error("Cannot reject this release request");
+        await tx.deal.update({
+          where: { id: dealId },
+          data: {
+            status: backTo,
+            releaseRequestedBy: null,
+            releaseRequestedAt: null,
+            releaseRequestedAmount: null,
+            releaseRequestedFrom: null,
+            releaseAgreedBy: null,
+            releaseAgreedAt: null,
+          },
+        });
+        await tx.escrowAuditLog.create({
+          data: { dealId, action: "RELEASE_REQUESTED", userId, notes: "Release request rejected by counterparty — deal continues" },
+        });
+        logger.info({ dealId, userId }, "Release request rejected");
+        return { agreed: false };
+      }
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: { releaseAgreedBy: userId, releaseAgreedAt: new Date() },
+      });
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "RELEASE_AGREED", userId,
+          amount: d.release_requested_amount ?? d.amount,
+          currency: d.currency ?? d.asset,
+          notes: "Counterparty agreed to the release request",
+        },
+      });
+      logger.info({ dealId, userId }, "Release request agreed");
+      return { agreed: true };
     });
   },
 
   /**
    * Escrower/admin confirms they manually paid the seller OUTSIDE the bot.
-   * Deal -> COMPLETED. Records payout details + FEE_RECORDED. No ledger move.
+   * Requires the counterparty's agreement. Supports partial releases: when
+   * the remaining amount is not fully released the deal returns to its
+   * previous state instead of completing.
    */
   async confirmManualRelease(dealId: string, adminUserId: string, reference?: string) {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
-      const t = canTransition(d.status, "COMPLETED", "ADMIN");
-      if (!t) throw new Error(`Cannot mark released from ${d.status} (deal must be RELEASE_REQUESTED)`);
+      if (d.status !== "RELEASE_REQUESTED") throw new Error(`Cannot mark released from ${d.status} (deal must be RELEASE_REQUESTED)`);
+      if (!d.release_agreed_at) throw new Error("The counterparty has not agreed to this release request yet");
 
       const dealAmount = new Prisma.Decimal(d.amount);
-      const sellerFee = dealAmount.mul(new Prisma.Decimal(d.seller_fee_bps)).div(new Prisma.Decimal(10000));
-      const sellerPayout = dealAmount.sub(sellerFee);
+      const released = new Prisma.Decimal(d.released_amount ?? "0");
+      const remaining = dealAmount.sub(released);
+      const reqAmount = d.release_requested_amount ? new Prisma.Decimal(d.release_requested_amount) : remaining;
+      if (reqAmount.lte(0) || reqAmount.gt(remaining)) {
+        throw new Error(`Invalid release amount ${reqAmount.toString()} (remaining ${remaining.toString()})`);
+      }
+
+      const sellerFee = reqAmount.mul(new Prisma.Decimal(d.seller_fee_bps)).div(new Prisma.Decimal(10000));
+      const sellerPayout = reqAmount.sub(sellerFee);
+      const newReleased = released.add(reqAmount);
+      const newRemaining = dealAmount.sub(newReleased);
       const buyerFee = new Prisma.Decimal(d.buyer_fee_amount ?? "0");
-      const escrowFee = buyerFee.add(sellerFee);
+      const prevSellerFee = new Prisma.Decimal(d.seller_fee_amount ?? "0");
+      const newSellerFee = prevSellerFee.add(sellerFee);
+
+      const complete = newRemaining.lte(0);
+      const nextStatus: DealStatus = complete ? "COMPLETED" : (d.release_requested_from === "FUNDED" ? "FUNDED" : "DELIVERED");
+      const t = canTransition("RELEASE_REQUESTED", nextStatus, "ADMIN");
+      if (!t) throw new Error(`Cannot complete release to ${nextStatus}`);
 
       await tx.deal.update({
         where: { id: dealId },
         data: {
-          status: "COMPLETED",
-          completedAt: new Date(),
+          status: nextStatus,
+          ...(complete ? { completedAt: new Date() } : {}),
           releasedAt: new Date(),
           releasedBy: adminUserId,
-          sellerFeeAmount: sellerFee,
-          sellerPayoutAmount: sellerPayout,
-          escrowFeeAmount: escrowFee,
+          releasedAmount: newReleased,
+          remainingAmount: newRemaining,
+          sellerFeeAmount: newSellerFee,
+          sellerPayoutAmount: newReleased.sub(newSellerFee),
+          escrowFeeAmount: buyerFee.add(newSellerFee),
           payoutMethod: d.payment_method as string,
           ...(reference ? { payoutReference: reference } : {}),
+          releaseRequestedAt: null,
+          releaseRequestedBy: null,
+          releaseRequestedAmount: null,
+          releaseRequestedFrom: null,
+          releaseAgreedBy: null,
+          releaseAgreedAt: null,
         },
       });
 
       await tx.escrowAuditLog.create({
         data: {
           dealId, action: "MANUAL_RELEASE_CONFIRMED", userId: adminUserId,
-          amount: sellerPayout, currency: d.currency ?? d.asset,
+          amount: reqAmount, currency: d.currency ?? d.asset,
           reference: reference ?? null,
-          notes: "Escrower manually paid the seller outside the bot",
+          notes: `Escrower manually paid the seller outside the bot (${reqAmount.toString()})`,
         },
       });
       await tx.escrowAuditLog.create({
         data: {
           dealId, action: "FEE_RECORDED", userId: d.seller_id ?? undefined,
           amount: sellerFee, currency: d.currency ?? d.asset,
-          notes: `Seller fee ${d.seller_fee_bps} bps (${sellerFee.toString()})`,
+          notes: `Seller fee ${d.seller_fee_bps} bps on released ${reqAmount.toString()} (${sellerFee.toString()})`,
         },
       });
 
@@ -344,8 +518,179 @@ export const dealService = {
         });
       }
 
-      logger.info({ dealId, adminUserId, sellerPayout: sellerPayout.toString() }, "Manual release confirmed -> COMPLETED");
-      return { dealId, sellerPayout: sellerPayout.toString(), sellerFee: sellerFee.toString(), escrowFee: escrowFee.toString() };
+      logger.info({ dealId, adminUserId, sellerPayout: sellerPayout.toString(), complete }, "Manual release confirmed");
+      return {
+        dealId,
+        sellerPayout: sellerPayout.toString(),
+        sellerFee: sellerFee.toString(),
+        escrowFee: buyerFee.add(newSellerFee).toString(),
+      };
+    });
+  },
+
+  /**
+   * A participant requests a refund (partial or full). The counterparty must
+   * agree (agreeRefund) before the escrower refunds the buyer manually.
+   */
+  async requestRefund(dealId: string, userId: string, amount?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.buyer_id !== userId && d.seller_id !== userId) throw new Error("Only a participant can request a refund");
+      const role = d.buyer_id === userId ? "BUYER" : "SELLER";
+      const t = canTransition(d.status, "REFUND_REQUESTED", role);
+      if (!t) throw new Error(`Cannot request refund from ${d.status}`);
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const released = new Prisma.Decimal(d.released_amount ?? "0");
+      const refunded = new Prisma.Decimal(d.refunded_amount ?? "0");
+      const remaining = dealAmount.sub(released).sub(refunded);
+      if (remaining.lte(0)) throw new Error("Nothing left to refund");
+
+      const reqAmount = amount ? new Prisma.Decimal(amount) : remaining;
+      if (reqAmount.lte(0)) throw new Error("Refund amount must be positive");
+      if (reqAmount.gt(remaining)) throw new Error(`Refund amount exceeds the remaining amount (${remaining.toString()})`);
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: "REFUND_REQUESTED",
+          refundRequestedAt: new Date(),
+          refundRequestedBy: userId,
+          refundRequestedAmount: reqAmount,
+          refundRequestedFrom: d.status,
+          refundAgreedBy: null,
+          refundAgreedAt: null,
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "REFUND_REQUESTED", userId,
+          amount: reqAmount, currency: d.currency ?? d.asset,
+          notes: amount
+            ? `Refund request (${reqAmount.toString()}) — awaiting counterparty agreement`
+            : `Refund request (all, ${reqAmount.toString()}) — awaiting counterparty agreement`,
+        },
+      });
+
+      logger.info({ dealId, userId, amount: reqAmount.toString() }, "Refund requested — awaiting counterparty agreement");
+      return { requestedAmount: reqAmount.toString(), remaining: remaining.toString() };
+    });
+  },
+
+  /**
+   * The counterparty agrees to (or rejects) a pending refund request.
+   */
+  async agreeRefund(dealId: string, userId: string, agree: boolean) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.status !== "REFUND_REQUESTED") throw new Error(`Cannot respond from ${d.status}`);
+      if (d.refund_requested_by === userId) throw new Error("You cannot respond to your own refund request");
+      if (d.buyer_id !== userId && d.seller_id !== userId) throw new Error("Only a participant can respond");
+
+      if (!agree) {
+        const backTo = d.refund_requested_from === "DELIVERED" ? "DELIVERED" : "FUNDED";
+        const t = canTransition("REFUND_REQUESTED", backTo, "ADMIN");
+        if (!t) throw new Error("Cannot reject this refund request");
+        await tx.deal.update({
+          where: { id: dealId },
+          data: {
+            status: backTo,
+            refundRequestedBy: null,
+            refundRequestedAt: null,
+            refundRequestedAmount: null,
+            refundRequestedFrom: null,
+            refundAgreedBy: null,
+            refundAgreedAt: null,
+          },
+        });
+        await tx.escrowAuditLog.create({
+          data: { dealId, action: "REFUND_REQUESTED", userId, notes: "Refund request rejected by counterparty — deal continues" },
+        });
+        logger.info({ dealId, userId }, "Refund request rejected");
+        return { agreed: false };
+      }
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: { refundAgreedBy: userId, refundAgreedAt: new Date() },
+      });
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "REFUND_AGREED", userId,
+          amount: d.refund_requested_amount ?? d.amount,
+          currency: d.currency ?? d.asset,
+          notes: "Counterparty agreed to the refund request",
+        },
+      });
+      logger.info({ dealId, userId }, "Refund request agreed");
+      return { agreed: true };
+    });
+  },
+
+  /**
+   * Escrower/admin confirms they manually refunded the buyer OUTSIDE the bot.
+   * Requires the counterparty's agreement. Supports partial refunds: the deal
+   * returns to its previous state while the remaining amount is > 0.
+   */
+  async completeManualRefund(dealId: string, adminUserId: string, reference?: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.status !== "REFUND_REQUESTED") throw new Error(`Cannot mark refunded from ${d.status} (deal must be REFUND_REQUESTED)`);
+      if (!d.refund_agreed_at) throw new Error("The counterparty has not agreed to this refund request yet");
+
+      const dealAmount = new Prisma.Decimal(d.amount);
+      const released = new Prisma.Decimal(d.released_amount ?? "0");
+      const refunded = new Prisma.Decimal(d.refunded_amount ?? "0");
+      const remaining = dealAmount.sub(released).sub(refunded);
+      const reqAmount = d.refund_requested_amount ? new Prisma.Decimal(d.refund_requested_amount) : remaining;
+      if (reqAmount.lte(0) || reqAmount.gt(remaining)) {
+        throw new Error(`Invalid refund amount ${reqAmount.toString()} (remaining ${remaining.toString()})`);
+      }
+
+      const newRefunded = refunded.add(reqAmount);
+      const newRemaining = dealAmount.sub(released).sub(newRefunded);
+      const complete = newRemaining.lte(0);
+      const nextStatus: DealStatus = complete ? "REFUNDED" : (d.refund_requested_from === "DELIVERED" ? "DELIVERED" : "FUNDED");
+      const t = canTransition("REFUND_REQUESTED", nextStatus, "ADMIN");
+      if (!t) throw new Error(`Cannot complete refund to ${nextStatus}`);
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: {
+          status: nextStatus,
+          ...(complete ? { completedAt: new Date() } : {}),
+          refundedAt: new Date(),
+          refundedBy: adminUserId,
+          refundedAmount: newRefunded,
+          remainingAmount: newRemaining,
+          ...(reference ? { refundReference: reference } : {}),
+          refundRequestedAt: null,
+          refundRequestedBy: null,
+          refundRequestedAmount: null,
+          refundRequestedFrom: null,
+          refundAgreedBy: null,
+          refundAgreedAt: null,
+        },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId, action: "MANUAL_REFUND_CONFIRMED", userId: adminUserId,
+          amount: reqAmount, currency: d.currency ?? d.asset,
+          reference: reference ?? null,
+          notes: `Escrower manually refunded the buyer outside the bot (${reqAmount.toString()})`,
+        },
+      });
+      await tx.transaction.create({
+        data: {
+          userId: d.buyer_id, type: "REFUND", asset: d.asset,
+          amount: reqAmount.toString(), status: "CONFIRMED", dealId,
+        },
+      });
+
+      logger.info({ dealId, adminUserId, amount: reqAmount.toString(), complete }, "Manual refund confirmed");
+      return { dealId, refundAmount: reqAmount.toString(), complete };
     });
   },
 
@@ -1121,13 +1466,13 @@ export const dealService = {
   // ── Cancel Deal (pre-funded only — no ledger touch) ──────────────
   async cancel(dealId: string, cancelledBy: string) {
     const deal = await prisma.$queryRaw<Array<{
-      id: string; status: DealStatus; buyer_id: string;
+      id: string; status: DealStatus; buyer_id: string; seller_id: string | null;
     }>>(
-      Prisma.sql`SELECT id, status, buyer_id as "buyerId" FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
+      Prisma.sql`SELECT id, status, buyer_id as "buyerId", seller_id as "sellerId" FROM deals WHERE id = ${dealId}::uuid FOR UPDATE`
     );
     if (!deal[0]) throw new Error("Deal not found");
-    const d = deal[0];
-    const role = cancelledBy === (d as any).buyerId ? "BUYER" : "SELLER";
+    const d = deal[0] as any;
+    const role = cancelledBy === d.buyerId ? "BUYER" : cancelledBy === d.sellerId ? "SELLER" : "ADMIN";
 
     const t = canTransition(d.status, "CANCELLED", role);
     if (!t) throw new Error(`Cannot cancel deal in ${d.status} state`);
@@ -1137,7 +1482,7 @@ export const dealService = {
       data: { status: "CANCELLED", completedAt: new Date() },
     });
 
-    logger.info({ dealId, cancelledBy }, "Deal cancelled");
+    logger.info({ dealId, cancelledBy, role }, "Deal cancelled");
   },
 
   // ── Expire Deals ────────────────────────────────────────────────

@@ -6,7 +6,10 @@ import { dealService } from "../services/dealService.js";
 import { notificationService } from "../services/notificationService.js";
 import { mainMenu, backToMain, dealTabs } from "./keyboards/index.js";
 import { handleJoinDeal, handleAcceptDeal, showDealStatus } from "./scenes/joinDeal.js";
-import { handleAcceptRelease, handleDeliver, handleDispute, handleDisputeReason } from "./scenes/depositDeliveryRelease.js";
+import {
+  handleAcceptRelease, handleDeliver, handleDispute, handleDisputeReason,
+  handleReleaseCommand, handleRefundCommand, handleReleaseAgree, handleRefundAgree,
+} from "./scenes/depositDeliveryRelease.js";
 import { showHistory, showMyDeals } from "./scenes/walletAndDeals.js";
 import {
   startDealForm, processDealFormCallback, processDealFormText,
@@ -14,7 +17,8 @@ import {
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
 import type { MyContext, SessionData } from "./context.js";
-import { adminDashboard, listDisputes, reviewDispute, handleAdminCallback, banUser, suspendUser, lookupUser } from "./admin.js";
+import { adminDashboard, listDisputes, reviewDispute, handleAdminCallback, banUser, suspendUser, lookupUser, setSettingValue } from "./admin.js";
+import { updateGroupDealCard } from "./scenes/dealForm.js";
 
 // ─── Bot Setup ────────────────────────────────────────────────────────
 const bot = new Bot<MyContext>(config.botToken);
@@ -149,6 +153,50 @@ bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
   await startDealForm(ctx);
 });
 
+// ─── /release and /refund (partial or all, resolved from deal context) ──
+bot.command("release", async (ctx) => {
+  const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+  const amount = parts.find((p) => /^\d+(\.\d{1,8})?$/.test(p));
+  const codeArg = parts.find((p) => /^[A-Za-z0-9]+$/.test(p) && p !== amount);
+  const deal = await resolveDealFromContext(ctx, codeArg);
+  if (!deal) {
+    await ctx.reply(
+      "<b>RELEASE</b>\n\nReply to the deal message, or send:\n" +
+      "<code>/release all</code> — full remaining amount\n" +
+      "<code>/release 50</code> — partial amount\n\n" +
+      "In DM you can also pass the deal code: <code>/release all ABC12345</code>"
+    );
+    return;
+  }
+  await handleReleaseCommand(ctx, deal, amount);
+});
+
+bot.command("refund", async (ctx) => {
+  const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+  const amount = parts.find((p) => /^\d+(\.\d{1,8})?$/.test(p));
+  const codeArg = parts.find((p) => /^[A-Za-z0-9]+$/.test(p) && p !== amount);
+  const deal = await resolveDealFromContext(ctx, codeArg);
+  if (!deal) {
+    await ctx.reply(
+      "<b>REFUND</b>\n\nReply to the deal message, or send:\n" +
+      "<code>/refund all</code> — full remaining amount\n" +
+      "<code>/refund 50</code> — partial amount\n\n" +
+      "In DM you can also pass the deal code: <code>/refund all ABC12345</code>"
+    );
+    return;
+  }
+  await handleRefundCommand(ctx, deal, amount);
+});
+
+// ─── Admin payment settings (admin-only) ────────────────────────────
+bot.command("settings", async (ctx) => {
+  if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+  await adminPaymentSettings(ctx);
+});
+
 // ─── Callback Query Router ─────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -239,11 +287,12 @@ bot.on("callback_query:data", async (ctx) => {
   // ── Deal: Status ──
   if (data.startsWith("deal:status:")) {
     const dealId = data.split(":")[2];
+    ctx.session.lastDealId = dealId;
     await showDealStatus(ctx, dealId);
     return;
   }
 
-  // ── Deal: Buyer reports "I've Paid" (manual payment) ──
+  // ── Deal: Payer reports "I've Paid" (manual payment) ──
   if (data.startsWith("deal:paid:")) {
     const dealId = data.split(":")[2];
     const deal = await dealService.findWithParties(dealId);
@@ -251,10 +300,11 @@ bot.on("callback_query:data", async (ctx) => {
       await ctx.answerCallbackQuery("Deal not found.");
       return;
     }
-    if (deal.buyerId !== ctx.session.userId) {
-      await ctx.answerCallbackQuery("Only the buyer can report payment.");
+    if (dealService.getPayerId(deal) !== ctx.session.userId) {
+      await ctx.answerCallbackQuery("Only the payer can report payment.");
       return;
     }
+    ctx.session.lastDealId = dealId;
     ctx.session.pendingPaymentReportDealId = dealId;
     await ctx.answerCallbackQuery("Let's record your payment.");
     await ctx.reply(
@@ -282,13 +332,37 @@ bot.on("callback_query:data", async (ctx) => {
   // ── Deal: Accept & Release (requests manual release — no auto payout) ──
   if (data.startsWith("deal:release:")) {
     const dealId = data.split(":")[2];
+    ctx.session.lastDealId = dealId;
     await handleAcceptRelease(ctx, dealId);
+    return;
+  }
+
+  // ── Deal: Release / Refund agreement callbacks ──
+  if (data.startsWith("deal:release_agree:")) {
+    const dealId = data.split(":")[2];
+    await handleReleaseAgree(ctx, dealId, true);
+    return;
+  }
+  if (data.startsWith("deal:release_reject:")) {
+    const dealId = data.split(":")[2];
+    await handleReleaseAgree(ctx, dealId, false);
+    return;
+  }
+  if (data.startsWith("deal:refund_agree:")) {
+    const dealId = data.split(":")[2];
+    await handleRefundAgree(ctx, dealId, true);
+    return;
+  }
+  if (data.startsWith("deal:refund_reject:")) {
+    const dealId = data.split(":")[2];
+    await handleRefundAgree(ctx, dealId, false);
     return;
   }
 
   // ── Deal: Deliver ──
   if (data.startsWith("deal:deliver:")) {
     const dealId = data.split(":")[2];
+    ctx.session.lastDealId = dealId;
     await handleDeliver(ctx, dealId);
     return;
   }
@@ -296,16 +370,31 @@ bot.on("callback_query:data", async (ctx) => {
   // ── Deal: Dispute ──
   if (data.startsWith("deal:dispute:")) {
     const dealId = data.split(":")[2];
+    ctx.session.lastDealId = dealId;
     await handleDispute(ctx, dealId);
     return;
   }
 
-  // ── Deal: Cancel ──
+  // ── Deal: Cancel (parties or admin; group card updated) ──
   if (data.startsWith("deal:cancel:")) {
     const dealId = data.split(":")[2];
+    const deal = await dealService.findWithParties(dealId);
+    if (!deal) {
+      await ctx.answerCallbackQuery("Deal not found.");
+      return;
+    }
+    const isParty = deal.buyerId === ctx.session.userId || deal.sellerId === ctx.session.userId;
+    const isAdminUser = ctx.from ? config.adminTelegramIds.has(ctx.from.id) : false;
+    if (!isParty && !isAdminUser) {
+      await ctx.answerCallbackQuery("Only the parties or an escrow admin can cancel.").catch(() => {});
+      return;
+    }
     try {
       await dealService.cancel(dealId, ctx.session.userId);
       await ctx.editMessageText("Deal cancelled.", { reply_markup: backToMain });
+      // Re-fetch so the group card reflects CANCELLED (the pre-cancel object is stale).
+      const cancelled = await dealService.findWithParties(dealId);
+      if (cancelled) await updateGroupDealCard(ctx, cancelled);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Unknown error";
       await ctx.answerCallbackQuery(msg);
@@ -398,6 +487,46 @@ bot.on("message:text", async (ctx, next) => {
       await ctx.reply(`Payout reference recorded for deal #${esc(dealId)}.`);
     } else {
       await ctx.reply("No reference recorded.");
+    }
+    return;
+  }
+
+  // 6b. Admin: optional refund reference after marking refunded
+  if (ctx.session.pendingRefundReferenceDealId) {
+    const dealId = ctx.session.pendingRefundReferenceDealId;
+    delete ctx.session.pendingRefundReferenceDealId;
+    if (text.toLowerCase() !== "/skip") {
+      const { prisma } = await import("../lib/db.js");
+      await prisma.deal.update({ where: { id: dealId }, data: { refundReference: text } });
+      await ctx.reply(`Refund reference recorded for deal #${esc(dealId)}.`);
+    } else {
+      await ctx.reply("No reference recorded.");
+    }
+    return;
+  }
+
+  // 6c. Admin: capture a payment setting value (/settings flow)
+  if (ctx.session.pendingSettingKey) {
+    const key = ctx.session.pendingSettingKey;
+    delete ctx.session.pendingSettingKey;
+    if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    if (text.toLowerCase() === "/cancel") {
+      await ctx.reply("Setting update cancelled.");
+      return;
+    }
+    if (text.trim().length < 3 || text.length > 300) {
+      ctx.session.pendingSettingKey = key;
+      await ctx.reply("Value must be between 3 and 300 characters. Please try again (or <code>/cancel</code>):");
+      return;
+    }
+    try {
+      await setSettingValue(key, text, ctx.session.userId);
+      await ctx.reply(`✅ <b>${esc(key.replace(/_/g, " ").toUpperCase())}</b> updated.\n\nUse <code>/settings</code> to review.`);
+    } catch (e: unknown) {
+      await ctx.reply(esc(e instanceof Error ? e.message : "Could not save setting"));
     }
     return;
   }
@@ -520,6 +649,62 @@ async function submitEvidence(ctx: MyContext, dealId: string, text: string, file
 
 // ─── Admin Commands ──────────────────────────────────────────────────
 bot.command("admin", adminDashboard);
+
+// ─── Admin: /settings command body ───────────────────────────────────
+async function adminPaymentSettings(ctx: MyContext) {
+  const { prisma } = await import("../lib/db.js");
+  const { getAdminSetting, SETTING_KEYS } = await import("../lib/paymentInstructions.js");
+  const [upiId, upiName, usdt] = await Promise.all([
+    getAdminSetting(SETTING_KEYS.upiId),
+    getAdminSetting(SETTING_KEYS.upiName),
+    getAdminSetting(SETTING_KEYS.usdtBep20Address),
+  ]);
+
+  await ctx.reply(
+    "<b>PAYMENT SETTINGS</b>\n\n" +
+    "These are the escrower's own receiving details — manually entered, never generated by the bot.\n\n" +
+    `💰 <b>INR / UPI</b>\n` +
+    `UPI ID: <code>${esc(upiId || "— not set —")}</code>\n` +
+    `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
+    `🪙 <b>USDT BEP20</b>\n` +
+    `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
+    `If a method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("Set UPI ID", `admin:settings:set:${SETTING_KEYS.upiId}`)
+        .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
+        .row()
+        .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
+        .row()
+        .text("\u{1F3E0}  Main Menu", "menu:main"),
+    }
+  );
+}
+
+/** Resolve the deal a /release or /refund refers to: replied-to deal card,
+ *  optional deal code argument, or the last deal the user interacted with. */
+async function resolveDealFromContext(ctx: MyContext, codeArg?: string) {
+  // 1. Replying to a bot deal card (group or DM).
+  const replyTo = ctx.message?.reply_to_message;
+  if (replyTo?.message_id && replyTo.from?.is_bot && ctx.chat) {
+    const { prisma } = await import("../lib/db.js");
+    const byMsg = await prisma.deal.findFirst({
+      where: { groupChatId: String(ctx.chat.id), groupMessageId: replyTo.message_id },
+    });
+    if (byMsg) return dealService.findWithParties(byMsg.id);
+  }
+  // 2. Deal code argument.
+  if (codeArg) {
+    const byCode = await dealService.findByInviteCode(codeArg.toUpperCase());
+    if (byCode) return dealService.findWithParties(byCode.id);
+  }
+  // 3. Last deal the user viewed (DM context).
+  if (ctx.session.lastDealId) {
+    const last = await dealService.findWithParties(ctx.session.lastDealId);
+    if (last) return last;
+  }
+  return null;
+}
 bot.command("disputes", listDisputes);
 bot.command("review", reviewDispute);
 bot.command("ban", banUser);

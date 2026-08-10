@@ -22,6 +22,7 @@ enum DealStatus {
   IN_PROGRESS
   DELIVERED
   RELEASE_REQUESTED
+  REFUND_REQUESTED
   // Legacy state (custodial era) — kept for historical rows + ledger tests.
   RELEASE_PENDING
   COMPLETED
@@ -56,19 +57,30 @@ enum PaymentReportStatus {
   REJECTED
 }
 
+enum CryptoPayer {
+  BUYER
+  SELLER
+}
+
 enum EscrowAuditAction {
+  DEAL_CREATED
+  ADMIN_ACCEPTED
+  PAYMENT_INSTRUCTIONS_SENT
   PAYMENT_REPORTED
   PAYMENT_VERIFIED
   PAYMENT_REJECTED
   EVIDENCE_REQUESTED
   EVIDENCE_SUBMITTED
+  DELIVERY_MARKED
   RELEASE_REQUESTED
+  RELEASE_AGREED
   MANUAL_RELEASE_CONFIRMED
   REFUND_REQUESTED
+  REFUND_AGREED
   MANUAL_REFUND_CONFIRMED
   FEE_RECORDED
-  DELIVERY_MARKED
   DISPUTE_OPENED
+  DISPUTE_RESOLVED
 }
 
 enum TransactionType {
@@ -166,6 +178,7 @@ model User {
   paymentReports      PaymentReport[] @relation("PaymentReporter")
   verifiedPayments    PaymentReport[] @relation("PaymentVerifier")
   escrowAuditLogs     EscrowAuditLog[]
+  adminSettings       AdminSetting[]
 
   @@map("users")
 }
@@ -203,25 +216,50 @@ model Deal {
   sellerFeeAmount      Decimal       @default(0) @map("seller_fee_amount") @db.Decimal(18, 8) // fee recorded at release
   // ── Manual payment verification (escrower-verified, no custody) ──
   paymentMethod        PaymentMethod @default(CRYPTO) @map("payment_method")
+  // Who sends USDT to the escrow (USDT deals only). BUYER or SELLER.
+  cryptoPayer          CryptoPayer?  @map("crypto_payer")
   currency             String?       @db.VarChar(10) // INR or asset symbol (USDT, BTC...)
   paymentReference     String?       @map("payment_reference") @db.VarChar(256)
+  // ── Escrow admin acceptance (group deal card) ──
+  acceptedBy           String?       @map("accepted_by") @db.Uuid
+  acceptedAt           DateTime?     @map("accepted_at") @db.Timestamptz()
+  paymentInstructionsSentAt DateTime? @map("payment_instructions_sent_at") @db.Timestamptz()
+  // The group message where the deal card lives (the message is the deal reference).
+  groupChatId          String?       @map("group_chat_id") @db.VarChar(64)
+  groupMessageId       Int?          @map("group_message_id")
   paymentReportedAt    DateTime?     @map("payment_reported_at") @db.Timestamptz()
   paymentReportedBy    String?       @map("payment_reported_by") @db.Uuid
   paymentVerifiedAt    DateTime?     @map("payment_verified_at") @db.Timestamptz()
   paymentVerifiedBy    String?       @map("payment_verified_by") @db.Uuid
   paymentEvidence      String?       @map("payment_evidence") @db.Text
   paymentNotes         String?       @map("payment_notes") @db.Text
+  // ── Release request / agreement / partial manual release ──
   releaseRequestedAt   DateTime?     @map("release_requested_at") @db.Timestamptz()
+  releaseRequestedBy   String?       @map("release_requested_by") @db.Uuid
+  releaseRequestedAmount Decimal?    @map("release_requested_amount") @db.Decimal(18, 8)
+  releaseRequestedFrom String?       @map("release_requested_from") @db.VarChar(20) // state before the request
+  releaseAgreedBy      String?       @map("release_agreed_by") @db.Uuid
+  releaseAgreedAt      DateTime?     @map("release_agreed_at") @db.Timestamptz()
+  releasedAmount       Decimal       @default(0) @map("released_amount") @db.Decimal(18, 8) // cumulative
   releasedAt           DateTime?     @map("released_at") @db.Timestamptz()
   releasedBy           String?       @map("released_by") @db.Uuid
   payoutReference      String?       @map("payout_reference") @db.VarChar(256)
   payoutMethod         String?       @map("payout_method") @db.VarChar(20)
   sellerPayoutAmount   Decimal?      @map("seller_payout_amount") @db.Decimal(18, 8)
   escrowFeeAmount      Decimal?      @map("escrow_fee_amount") @db.Decimal(18, 8) // buyer fee + seller fee
+  // ── Refund request / agreement / partial manual refund ──
   refundRequestedAt    DateTime?     @map("refund_requested_at") @db.Timestamptz()
+  refundRequestedBy    String?       @map("refund_requested_by") @db.Uuid
+  refundRequestedAmount Decimal?     @map("refund_requested_amount") @db.Decimal(18, 8)
+  refundRequestedFrom  String?       @map("refund_requested_from") @db.VarChar(20) // state before the request
+  refundAgreedBy       String?       @map("refund_agreed_by") @db.Uuid
+  refundAgreedAt       DateTime?     @map("refund_agreed_at") @db.Timestamptz()
+  refundedAmount       Decimal       @default(0) @map("refunded_amount") @db.Decimal(18, 8) // cumulative
   refundedAt           DateTime?     @map("refunded_at") @db.Timestamptz()
   refundedBy           String?       @map("refunded_by") @db.Uuid
   refundReference      String?       @map("refund_reference") @db.VarChar(256)
+  // Remaining escrow principal (deal amount - released - refunded).
+  remainingAmount      Decimal?      @map("remaining_amount") @db.Decimal(18, 8)
   description          String        @db.Text
   category             DealCategory
   status               DealStatus
@@ -450,6 +488,23 @@ model EscrowAuditLog {
   @@index([dealId, createdAt])
   @@index([action])
   @@map("escrow_audit_logs")
+}
+
+// ─── Admin Settings (admin-entered escrow payment details) ─────────────
+// Only authorized admins can modify these. The bot NEVER generates these
+// values — they are the escrower's own receiving details, entered via
+// /settings in the bot. Env vars (ESCROW_UPI_ID etc.) are used only as a
+// fallback when a setting has not been entered yet.
+
+model AdminSetting {
+  key       String    @id @db.VarChar(64)
+  value     String    @db.Text
+  updatedBy String?   @map("updated_by") @db.Uuid
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  admin User? @relation(fields: [updatedBy], references: [id])
+
+  @@map("admin_settings")
 }
 
 // ─── Disputes ─────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ import { getPaymentInstructionsText, hasPaymentInstructions } from "../../lib/pa
 type Ctx = any;
 
 function paymentLabel(deal: any): string {
-  return deal.paymentMethod === "INR" ? "INR / UPI" : "Crypto";
+  return deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20";
 }
 
 function dealAmountStr(deal: any): string {
@@ -44,6 +44,7 @@ export async function handleJoinDeal(ctx: Ctx, inviteCode: string) {
   }
 
   const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
+  ctx.session.lastDealId = deal.id;
 
   const buyerFeePct = bpsToPercent(deal.buyerFeeBps ?? config.buyerFeeBps);
   const sellerFeePct = bpsToPercent(deal.sellerFeeBps ?? config.sellerFeeBps);
@@ -69,6 +70,7 @@ export async function handleJoinDeal(ctx: Ctx, inviteCode: string) {
 export async function handleAcceptDeal(ctx: Ctx) {
   const dealId = ctx.session.pendingJoinDealId;
   if (!dealId) return;
+  ctx.session.lastDealId = dealId;
 
   try {
     await dealService.join(dealId, ctx.session.userId);
@@ -80,7 +82,7 @@ export async function handleAcceptDeal(ctx: Ctx) {
       `🔐 <b>PAYMENT REQUIRED</b>\n\n` +
       `Payment method: <b>${deal ? paymentLabel(deal) : ""}</b>\n` +
       `Amount: <b>${deal ? dealAmountStr(deal) : ""}</b>\n\n` +
-      `${deal ? paymentInstructionsBlock(deal) : ""}\n\n` +
+      `${deal ? await paymentInstructionsBlock(deal) : ""}\n\n` +
       `After you have paid the escrower, tap <b>I've Paid</b> below.`,
       {
         reply_markup: new InlineKeyboard()
@@ -100,7 +102,7 @@ export async function handleAcceptDeal(ctx: Ctx) {
           `🔐 <b>PAYMENT REQUIRED</b>\n\n` +
           `Payment method: <b>${paymentLabel(deal)}</b>\n` +
           `Amount: <b>${dealAmountStr(deal)}</b>\n\n` +
-          `${paymentInstructionsBlock(deal)}\n\n` +
+          `${await paymentInstructionsBlock(deal)}\n\n` +
           `After you have paid the escrower, tap <b>I've Paid</b> below.`,
           {
             parse_mode: "HTML",
@@ -122,11 +124,11 @@ export async function handleAcceptDeal(ctx: Ctx) {
 
 /** Payment instructions block — configured escrower details or a clear
  *  "unavailable" fallback. NEVER an auto-generated address. */
-function paymentInstructionsBlock(deal: any): string {
-  if (hasPaymentInstructions(deal)) {
-    return `💳 <b>How to pay:</b>\n${getPaymentInstructionsText(deal)}`;
+async function paymentInstructionsBlock(deal: any): Promise<string> {
+  if (await hasPaymentInstructions(deal)) {
+    return `💳 <b>How to pay:</b>\n${await getPaymentInstructionsText(deal)}`;
   }
-  return "Payment instructions are currently unavailable. Please contact the escrower.";
+  return "Payment method is currently unavailable. Please contact an admin.";
 }
 
 export async function showDealStatus(ctx: Ctx, dealId: string) {

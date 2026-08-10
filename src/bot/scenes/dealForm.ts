@@ -4,11 +4,12 @@ import { config } from "../../config/index.js";
 import { userService } from "../../services/userService.js";
 import { dealService } from "../../services/dealService.js";
 import { notificationService } from "../../services/notificationService.js";
+import { prisma } from "../../lib/db.js";
 import { logger } from "../../lib/logger.js";
 import { esc } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import {
-  paymentMethodSelect, roleSelect, cryptoDenominationSelect, categorySelect,
+  paymentMethodSelect, roleSelect, cryptoPayerSelect, categorySelect,
   formConfirm, activeFormOptions, backToMain,
 } from "../keyboards/index.js";
 import type { MyContext } from "../context.js";
@@ -21,15 +22,17 @@ import type { MyContext } from "../context.js";
  *   - /form command
  *   - "form" text message
  *
- * Flow: payment method -> role -> counterparty -> amount -> (crypto
- * denomination) -> category -> description -> preview -> confirm.
- * On confirm the SAME dealService.create() + state machine is used as the
+ * Flow: payment method (INR / UPI | USDT BEP20) -> role -> counterparty ->
+ * amount -> (USDT: crypto payer) -> category -> description -> preview.
+ * On confirm the same dealService.create() + state machine is used as the
  * group-post entry point, so button/form/command deals are identical.
+ *
+ * Only two payment methods are supported: INR / UPI and USDT on BEP20.
  */
 
 export type DealFormStep =
   | "payment_method" | "role" | "counterparty" | "amount"
-  | "crypto_network" | "category" | "description" | "preview";
+  | "crypto_payer" | "category" | "description" | "preview";
 
 function clearForm(ctx: MyContext) {
   const s = ctx.session;
@@ -41,12 +44,13 @@ function clearForm(ctx: MyContext) {
   s.createDealAmount = undefined;
   s.createDealAsset = undefined;
   s.createDealNetwork = undefined;
+  s.createDealCryptoPayer = undefined;
   s.createDealDescription = undefined;
   s.createDealCategory = undefined;
 }
 
-function paymentLabel(method?: string): string {
-  return method === "INR" ? "INR / UPI" : "Crypto";
+export function paymentLabel(method?: string): string {
+  return method === "INR" ? "INR / UPI" : "USDT BEP20";
 }
 
 /** Render the current step's prompt again (used by "Continue"). */
@@ -54,7 +58,7 @@ export function renderCurrentStep(ctx: MyContext): string | null {
   const s = ctx.session;
   switch (s.createDealStep as DealFormStep | undefined) {
     case "payment_method":
-      return "Choose the <b>payment method</b>:\n\n1. <b>INR / UPI</b> — pay the escrower via UPI\n2. <b>Crypto</b> — pay the escrower in crypto";
+      return "<b>CREATE DEAL</b>\n\nChoose the <b>payment method</b>:\n\n1. <b>INR / UPI</b> — pay the escrower via UPI\n2. <b>USDT (BEP20)</b> — pay the escrower in USDT on BEP20";
     case "role":
       return "Choose your <b>role</b> in this deal:";
     case "counterparty":
@@ -62,9 +66,9 @@ export function renderCurrentStep(ctx: MyContext): string | null {
     case "amount":
       return s.createDealPaymentMethod === "INR"
         ? "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>INR</b>:\n\n<i>Example: 10000</i>"
-        : "<b>DEAL AMOUNT</b>\n\nEnter the amount in your chosen crypto:\n\n<i>Example: 100</i>";
-    case "crypto_network":
-      return "Which <b>crypto denomination</b> is the payment in?";
+        : "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>USDT</b>:\n\n<i>Example: 100</i>";
+    case "crypto_payer":
+      return "Who is <b>paying USDT to the escrow</b>?\n\nIn both cases the escrower manually holds and verifies the real funds — the bot only records the payment.";
     case "category":
       return "<b>CATEGORY</b>\n\nSelect the trade category:";
     case "description":
@@ -91,7 +95,7 @@ export async function startDealForm(ctx: MyContext) {
   await ctx.reply(
     "<b>CREATE DEAL</b>\n\nChoose the <b>payment method</b>:\n\n" +
     "1. <b>INR / UPI</b> — pay the escrower via UPI\n" +
-    "2. <b>Crypto</b> — pay the escrower in crypto\n\n" +
+    "2. <b>USDT (BEP20)</b> — pay the escrower in USDT on BEP20\n\n" +
     "The escrower personally verifies the payment — the bot never holds funds.",
     { reply_markup: paymentMethodSelect }
   );
@@ -111,9 +115,8 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     const kb =
       s.createDealStep === "payment_method" ? paymentMethodSelect
       : s.createDealStep === "role" ? roleSelect
-      : s.createDealStep === "crypto_network" ? cryptoDenominationSelect
+      : s.createDealStep === "crypto_payer" ? cryptoPayerSelect
       : s.createDealStep === "category" ? categorySelect
-      : s.createDealStep === "description" ? backToMain
       : backToMain;
     await ctx.reply(prompt ?? "<b>CREATE DEAL</b>", { reply_markup: kb });
     return true;
@@ -129,9 +132,14 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     return true;
   }
 
-  // ── Payment method ──
-  if (data === "form:payment:INR" || data === "form:payment:CRYPTO") {
-    s.createDealPaymentMethod = data === "form:payment:INR" ? "INR" : "CRYPTO";
+  // ── Payment method (INR / UPI or USDT BEP20 only) ──
+  if (data === "form:payment:INR" || data === "form:payment:USDT") {
+    const isUsdt = data === "form:payment:USDT";
+    s.createDealPaymentMethod = isUsdt ? "CRYPTO" : "INR";
+    if (isUsdt) {
+      s.createDealAsset = "USDT";
+      s.createDealNetwork = "BEP20";
+    }
     s.createDealStep = "role";
     await ctx.editMessageText(
       "<b>CREATE DEAL</b>\n\nPayment method: <b>" + paymentLabel(s.createDealPaymentMethod) + "</b>\n\nChoose your <b>role</b>:",
@@ -153,15 +161,13 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     return true;
   }
 
-  // ── Crypto denomination (payment method ONLY — never a deposit address) ──
-  if (data.startsWith("form:asset:")) {
-    const parts = data.replace("form:asset:", "").split("_");
-    s.createDealAsset = parts[0];
-    s.createDealNetwork = parts[1] ?? parts[0];
+  // ── Crypto payer (USDT only — bot only records who pays) ──
+  if (data === "form:crypto_payer:BUYER" || data === "form:crypto_payer:SELLER") {
+    s.createDealCryptoPayer = data.endsWith("SELLER") ? "SELLER" : "BUYER";
     s.createDealStep = "category";
     await ctx.editMessageText(
-      `<b>CREATE DEAL</b>\n\nDenomination: <b>${esc(parts[0])}${parts[1] ? " (" + esc(parts[1]) + ")" : ""}</b>\n\n` +
-      "This is only the payment denomination. You will pay the escrower directly.",
+      `<b>CREATE DEAL</b>\n\nCrypto payer: <b>${s.createDealCryptoPayer === "SELLER" ? "Seller" : "Buyer"}</b>\n\n` +
+      "The escrower manually receives and verifies the USDT. The bot only records the payment.\n\n<b>CATEGORY</b>\n\nSelect the trade category:",
       { reply_markup: categorySelect }
     );
     return true;
@@ -237,7 +243,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     await ctx.reply(
       s.createDealPaymentMethod === "INR"
         ? "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>INR</b>:\n\n<i>Example: 10000</i>"
-        : "<b>DEAL AMOUNT</b>\n\nEnter the amount in your chosen crypto:\n\n<i>Example: 100</i>",
+        : "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>USDT</b>:\n\n<i>Example: 100</i>",
       { reply_markup: backToMain }
     );
     return true;
@@ -251,7 +257,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
         "Invalid amount. Please enter a <b>positive number</b>.\n\n" +
         (s.createDealPaymentMethod === "INR"
           ? "Example: <code>10000</code> (INR)"
-          : "Example: <code>100</code>"),
+          : "Example: <code>100</code> (USDT)"),
         { reply_markup: backToMain }
       );
       return true; // stay on the step
@@ -259,13 +265,14 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealAmount = clean;
 
     if (s.createDealPaymentMethod === "CRYPTO") {
-      s.createDealStep = "crypto_network";
+      s.createDealStep = "crypto_payer";
       await ctx.reply(
-        "Which <b>crypto denomination</b> is the payment in?",
-        { reply_markup: cryptoDenominationSelect }
+        "Who is <b>paying USDT to the escrow</b>?\n\n" +
+        "In both cases the escrower manually holds and verifies the real funds — the bot only records the payment.",
+        { reply_markup: cryptoPayerSelect }
       );
     } else {
-      // INR: no separate asset step. asset=INR, network=UPI.
+      // INR: asset=INR, network=UPI.
       s.createDealAsset = "INR";
       s.createDealNetwork = "UPI";
       s.createDealStep = "category";
@@ -310,9 +317,14 @@ export async function previewDealForm(ctx: MyContext) {
   const buyerTotalStr = isInr ? formatMoney(buyerTotal, "INR") : formatMoney(buyerTotal, asset);
   const sellerReceivesStr = isInr ? formatMoney(sellerReceives, "INR") : formatMoney(sellerReceives, asset);
 
+  const cryptoPayerLine = s.createDealPaymentMethod === "CRYPTO"
+    ? `Crypto payer: <b>${s.createDealCryptoPayer === "SELLER" ? "Seller" : "Buyer"}</b>\n`
+    : "";
+
   await ctx.reply(
     `<b>CREATE ESCROW</b>\n\n` +
     `Payment: <b>${paymentLabel(s.createDealPaymentMethod)}</b>\n` +
+    cryptoPayerLine +
     `Amount: <b>${amountStr}</b>\n` +
     `Buyer: ${buyerHandle}\n` +
     `Seller: ${sellerHandle}\n` +
@@ -327,30 +339,61 @@ export async function previewDealForm(ctx: MyContext) {
   );
 }
 
-/** Build the group-post deal card (old form template style). */
-export function buildDealCard(deal: any, buyerUsername: string | null, sellerUsername: string | null): string {
+function groupStatusLabel(status: string): string {
+  const map: Record<string, string> = {
+    CREATED: "WAITING FOR ADMIN",
+    JOINED: "WAITING FOR ADMIN",
+    AWAITING_PAYMENT: "AWAITING PAYMENT",
+    PAYMENT_REPORTED: "PAYMENT REPORTED",
+    FUNDED: "FUNDED — PAYMENT VERIFIED",
+    DELIVERED: "DELIVERED",
+    RELEASE_REQUESTED: "RELEASE REQUESTED",
+    REFUND_REQUESTED: "REFUND REQUESTED",
+    DISPUTED: "DISPUTED",
+    UNDER_REVIEW: "UNDER REVIEW",
+    COMPLETED: "COMPLETED",
+    REFUNDED: "REFUNDED",
+    RELEASED: "RELEASED",
+    CANCELLED: "CANCELLED",
+    EXPIRED: "EXPIRED",
+  };
+  return map[status] ?? status.replace(/_/g, " ");
+}
+
+/** Build the group-post deal card. The Telegram message itself is the deal
+ *  reference — there are NO web links. */
+export function buildDealCard(
+  deal: any,
+  buyerUsername: string | null,
+  sellerUsername: string | null,
+  status?: string
+): string {
   const isInr = (deal.asset ?? "") === "INR" || (deal.paymentMethod ?? "") === "INR";
   const amountStr = isInr ? formatMoney(deal.amount.toString(), "INR") : formatMoney(deal.amount.toString(), deal.asset);
   const buyerFeeStr = isInr ? formatMoney(deal.buyerFeeAmount.toString(), "INR") : formatMoney(deal.buyerFeeAmount.toString(), deal.asset);
   const sellerFeeStr = isInr ? formatMoney(deal.sellerFeeAmount.toString(), "INR") : formatMoney(deal.sellerFeeAmount.toString(), deal.asset);
+  const isUsdt = !isInr;
+  const cryptoPayerLine = isUsdt
+    ? `Crypto payer: <b>${(deal.cryptoPayer ?? "BUYER") === "SELLER" ? "Seller" : "Buyer"}</b>\n`
+    : "";
 
   return (
-    `<b>╔════════════════════╗\n   ESCROW DEAL\n╚════════════════════╝</b>\n\n` +
-    `Deal ID: <code>#${esc(deal.inviteCode)}</code>\n\n` +
+    `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
     `👤 Buyer: @${esc(buyerUsername ?? "N/A")}\n` +
     `👤 Seller: @${esc(sellerUsername ?? "N/A")}\n\n` +
-    `💳 Payment: ${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}\n` +
-    `💰 Deal Amount: <b>${amountStr}</b>\n\n` +
-    `💸 Buyer Fee: ${buyerFeeStr}\n` +
-    `💸 Seller Fee: ${sellerFeeStr}\n\n` +
-    `📦 Category: ${esc(deal.category?.replace(/_/g, " ") ?? "")}\n\n` +
+    `💳 Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}</b>\n` +
+    cryptoPayerLine +
+    `💰 Amount: <b>${amountStr}</b>\n` +
+    `📦 Category: ${esc(deal.category?.replace(/_/g, " ") ?? "")}\n` +
     `📝 Terms:\n${esc(deal.description)}\n\n` +
+    `💸 Buyer fee: ${buyerFeeStr} · Seller fee: ${sellerFeeStr}\n\n` +
+    `Status: <b>${esc(status ?? groupStatusLabel(deal.status ?? "CREATED"))}</b>\n\n` +
     `🔐 Payment is manually verified by the escrower.`
   );
 }
 
 /** Create the deal from the completed form, post the card to the escrow
- *  group and notify the counterparty. */
+ *  group (the deal reference) and notify the counterparty. */
 export async function createDealFromForm(ctx: MyContext) {
   const s = ctx.session;
   try {
@@ -358,7 +401,7 @@ export async function createDealFromForm(ctx: MyContext) {
     const sellerId = s.createDealRole === "seller" ? s.userId : (s.createDealCounterpartyUserId ?? null);
     const paymentMethod = s.createDealPaymentMethod ?? "CRYPTO";
     const asset = s.createDealAsset ?? (paymentMethod === "INR" ? "INR" : "USDT");
-    const network = s.createDealNetwork ?? (paymentMethod === "INR" ? "UPI" : "TRC20");
+    const network = s.createDealNetwork ?? (paymentMethod === "INR" ? "UPI" : "BEP20");
 
     const deal = await dealService.create({
       buyerUserId: buyerId,
@@ -369,11 +412,12 @@ export async function createDealFromForm(ctx: MyContext) {
       network,
       paymentMethod,
       currency: paymentMethod === "INR" ? "INR" : asset,
+      cryptoPayer: paymentMethod === "CRYPTO" ? (s.createDealCryptoPayer ?? "BUYER") : undefined,
       description: s.createDealDescription ?? "",
       category: (s.createDealCategory ?? "FREELANCE_SERVICES") as DealCategory,
     });
 
-    // Notify counterparty
+    // Notify counterparty (no web link — the group card is the deal reference).
     if (s.createDealCounterpartyUserId) {
       await notificationService.notifyDealCreated(
         s.createDealCounterpartyUserId,
@@ -381,7 +425,8 @@ export async function createDealFromForm(ctx: MyContext) {
         s.createDealAmount ?? "0",
         paymentMethod === "INR" ? "INR" : asset,
         s.createDealDescription ?? "",
-        paymentLabel(paymentMethod)
+        paymentLabel(paymentMethod),
+        s.createDealCryptoPayer
       );
     }
 
@@ -392,20 +437,16 @@ export async function createDealFromForm(ctx: MyContext) {
       s.createDealRole === "seller" ? (s.username ?? null) : (s.createDealCounterpartyUsername ?? null);
     await postDealCardToGroup(ctx, deal, intendedSellerUsername);
 
-    const botInfo = await ctx.api.getMe();
-    const link = `https://t.me/${botInfo.username}?start=deal_${deal.inviteCode}`;
-
     await ctx.reply(
       `<b>DEAL CREATED</b>\n\n` +
       `Deal ID: <code>#${deal.inviteCode}</code>\n\n` +
       `Payment: <b>${paymentLabel(paymentMethod)}</b>\n` +
-      `Waiting for the ${s.createDealRole === "buyer" ? "seller" : "buyer"} to join.\n\n` +
-      `Invite Link:\n<code>${link}</code>\n\n` +
-      `Do NOT send any payment until both parties have joined and you see the payment instructions.`,
+      (paymentMethod === "CRYPTO" ? `Crypto payer: <b>${s.createDealCryptoPayer === "SELLER" ? "Seller" : "Buyer"}</b>\n` : "") +
+      `Amount: <b>${formatMoney(parseFloat(s.createDealAmount ?? "0"), asset === "INR" ? "INR" : asset)}</b>\n\n` +
+      `The deal has been posted to the escrow group and is <b>waiting for the escrow admin to accept it</b>.\n\n` +
+      `⚠️ Do <b>NOT</b> send any payment until the admin accepts and you receive the payment instructions.`,
       {
         reply_markup: new InlineKeyboard()
-          .text("Copy Deal Link", `deal:copy:${deal.inviteCode}`)
-          .row()
           .text("Cancel Deal", `deal:cancel:${deal.id}`)
           .row()
           .text("Main Menu", "menu:main"),
@@ -419,7 +460,10 @@ export async function createDealFromForm(ctx: MyContext) {
   clearForm(ctx);
 }
 
-/** Post the completed deal card to the configured escrow group. */
+/** Post the completed deal card to the configured escrow group and remember
+ *  the message (chat id + message id) on the deal so it can be updated as the
+ *  deal progresses. The Telegram message itself is the deal reference — the
+ *  bot never generates web links. */
 export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSellerUsername?: string | null) {
   const groupId = config.escrowGroupId.trim();
   if (!groupId) {
@@ -432,24 +476,53 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSel
   // intended seller from the form (buyer-created deals have no sellerId yet).
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
   const sellerName = seller?.username ?? intendedSellerUsername ?? null;
-  const botInfo = await ctx.api.getMe();
-  const link = `https://t.me/${botInfo.username}?start=deal_${deal.inviteCode}`;
-  const cancelLink = `https://t.me/${botInfo.username}?start=cancel_${deal.inviteCode}`;
 
   const kb = new InlineKeyboard()
-    .url("Accept Deal", link)
-    .url("View Deal", link)
-    .row()
-    .url("Cancel Deal", cancelLink);
+    .text("✅  Accept Deal", `admin:accept_deal:${deal.id}`)
+    .text("❌  Cancel Deal", `deal:cancel:${deal.id}`);
 
   try {
-    await ctx.api.sendMessage(
+    const sent = await ctx.api.sendMessage(
       groupId,
-      buildDealCard(deal, buyer?.username ?? null, sellerName),
+      buildDealCard(deal, buyer?.username ?? null, sellerName, "WAITING FOR ADMIN"),
       { parse_mode: "HTML", reply_markup: kb }
     );
-    logger.info({ dealId: deal.id, groupId }, "Deal card posted to escrow group");
+    await prisma.deal.update({
+      where: { id: deal.id },
+      data: {
+        groupChatId: String(sent.chat.id),
+        groupMessageId: sent.message_id,
+      },
+    });
+    logger.info({ dealId: deal.id, groupId, messageId: sent.message_id }, "Deal card posted to escrow group");
   } catch (e) {
     logger.warn({ dealId: deal.id, groupId, err: e }, "Failed to post deal card to escrow group");
+  }
+}
+
+/** Edit the group deal card with the current status (the group message stays
+ *  the single source of truth for the deal). */
+export async function updateGroupDealCard(ctx: MyContext, deal: any) {
+  if (!deal?.groupChatId || !deal?.groupMessageId) return;
+  const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
+  const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
+  const status = groupStatusLabel(deal.status);
+
+  const acceptedByLine = deal.acceptedAt && deal.acceptedBy
+    ? `\nAccepted by: @${esc(deal.acceptedByUsername ?? "escrow admin")}`
+    : "";
+
+  const kb = new InlineKeyboard()
+    .text("📋  View Status", `deal:status:${deal.id}`);
+
+  try {
+    await ctx.api.editMessageText(
+      deal.groupChatId,
+      deal.groupMessageId,
+      buildDealCard(deal, buyer?.username ?? null, seller?.username ?? null, status + acceptedByLine),
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+  } catch (e) {
+    logger.warn({ dealId: deal.id, err: e }, "Failed to update group deal card");
   }
 }
