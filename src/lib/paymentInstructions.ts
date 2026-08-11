@@ -12,6 +12,7 @@ export const SETTING_KEYS = {
   upiId: "upi_id",
   upiName: "upi_name",
   usdtBep20Address: "usdt_bep20_address",
+  escrowGroupId: "escrow_group_id",
 } as const;
 
 /** Read one admin setting, falling back to env config when absent. */
@@ -25,7 +26,17 @@ export async function getAdminSetting(key: string): Promise<string> {
   if (key === SETTING_KEYS.upiId) return config.escrow.upiId.trim();
   if (key === SETTING_KEYS.upiName) return config.escrow.upiName.trim();
   if (key === SETTING_KEYS.usdtBep20Address) return (config.escrow.cryptoAddresses["USDT_BEP20"] ?? "").trim();
+  if (key === SETTING_KEYS.escrowGroupId) return config.escrowGroupId.trim();
   return "";
+}
+
+/**
+ * The escrow group chat id deal cards are posted to. The admin-entered
+ * `escrow_group_id` setting wins (settable via /settings without redeploying);
+ * otherwise the `ESCROW_GROUP_ID` env fallback is used.
+ */
+export async function getEscrowGroupId(): Promise<string> {
+  return (await getAdminSetting(SETTING_KEYS.escrowGroupId)).trim();
 }
 
 export const UNAVAILABLE_MESSAGE =

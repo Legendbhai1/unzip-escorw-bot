@@ -7,7 +7,7 @@ import { dealService } from "../../services/dealService.js";
 import { notificationService } from "../../services/notificationService.js";
 import { prisma } from "../../lib/db.js";
 import { logger } from "../../lib/logger.js";
-import { esc } from "../../lib/html.js";
+import { esc, userMention } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import { parseDurationDeadline } from "../../lib/dealTerms.js";
 import {
@@ -462,11 +462,12 @@ export function groupCardKeyboard(deal: any): InlineKeyboard {
 }
 
 /** Build the group-post deal card. The Telegram message itself is the deal
- *  reference — there are NO web links. */
+ *  reference — there are NO web links. Buyer/seller are rendered as clickable
+ *  tg://user mentions so they work in groups regardless of privacy mode. */
 export function buildDealCard(
   deal: any,
-  buyerUsername: string | null,
-  sellerUsername: string | null,
+  buyer: { username?: string | null; telegramId?: bigint | number | null } | null | undefined,
+  seller: { username?: string | null; telegramId?: bigint | number | null } | null | undefined,
   status?: string
 ): string {
   const isInr = (deal.asset ?? "") === "INR" || (deal.paymentMethod ?? "") === "INR";
@@ -490,14 +491,14 @@ export function buildDealCard(
   // Party agreement block — the bot records who actually clicked.
   const agreementBlock =
     `🤝 <b>AGREEMENT</b>\n` +
-    `Buyer: ${buyerUsername ? `@${esc(buyerUsername)}` : "—"} ${deal.buyerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n` +
-    `Seller: ${sellerUsername ? `@${esc(sellerUsername)}` : "—"} ${deal.sellerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n`;
+    `Buyer: ${buyer ? userMention(buyer.telegramId, buyer.username) : "—"} ${deal.buyerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n` +
+    `Seller: ${seller ? userMention(seller.telegramId, seller.username) : "—"} ${deal.sellerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n`;
 
   return (
     `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
     `━━━━━━━━━━━━━━━━\n` +
-    `👤 Buyer: @${esc(buyerUsername ?? "N/A")}\n` +
-    `👤 Seller: @${esc(sellerUsername ?? "N/A")}\n\n` +
+    `👤 Buyer: ${userMention(buyer?.telegramId, buyer?.username)}\n` +
+    `👤 Seller: ${userMention(seller?.telegramId, seller?.username)}\n\n` +
     `💳 Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}</b>\n` +
     cryptoPayerLine +
     `💰 Amount: <b>${amountStr}</b>\n` +
@@ -514,10 +515,12 @@ export function buildDealCard(
   );
 }
 
-/** Resolve the escrow group a new deal card is posted to: the configured
- *  ESCROW_GROUP_ID when set, otherwise the first approved group. */
+/** Resolve the escrow group a new deal card is posted to: the admin-entered
+ *  `escrow_group_id` setting (or the ESCROW_GROUP_ID env fallback), otherwise
+ *  the first approved group. */
 export async function resolveEscrowGroupId(): Promise<string> {
-  const configured = config.escrowGroupId.trim();
+  const { getEscrowGroupId } = await import("../../lib/paymentInstructions.js");
+  const configured = (await getEscrowGroupId()).trim();
   if (configured) return configured;
   const approved = await groupService.getFirstApprovedGroupId();
   return approved ?? "";
@@ -620,8 +623,9 @@ export async function createDealFromForm(ctx: MyContext) {
 /** Post the completed deal card to an APPROVED escrow group and remember the
  *  message (chat id + message id) on the deal so it can be updated as the deal
  *  progresses. The Telegram message itself is the deal reference — the bot
- *  never generates web links. Refuses to post to a group that has not been
- *  approved via /allowgroup. */
+ *  never generates web links. The group id is the admin-entered
+ *  `escrow_group_id` setting (or the ESCROW_GROUP_ID env fallback / first
+ *  approved group) and MUST be approved via /allowgroup before cards post. */
 export async function postDealCardToGroup(
   ctx: MyContext,
   deal: any,
@@ -639,17 +643,18 @@ export async function postDealCardToGroup(
   }
 
   const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
-  // If the seller has joined, use their real username; otherwise show the
-  // intended seller from the form (buyer-created deals have no sellerId yet).
+  // If the seller has joined, use their real username; otherwise resolve the
+  // intended seller from the form (buyer-created deals have no sellerId yet)
+  // so the card shows a correct, clickable mention.
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
-  const sellerName = seller?.username ?? intendedSellerUsername ?? null;
+  const sellerResolved = seller ?? (intendedSellerUsername ? await userService.findByUsername(intendedSellerUsername) : null);
 
   const kb = groupCardKeyboard(deal);
 
   try {
     const sent = await ctx.api.sendMessage(
       target,
-      buildDealCard(deal, buyer?.username ?? null, sellerName, dealCardStatusLabel(deal)),
+      buildDealCard(deal, buyer, sellerResolved, dealCardStatusLabel(deal)),
       { parse_mode: "HTML", reply_markup: kb }
     );
     await prisma.deal.update({
@@ -673,9 +678,14 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
   const status = dealCardStatusLabel(deal);
 
-  const acceptedByLine = deal.acceptedAt && deal.acceptedBy
-    ? `\nAccepted by: @${esc(deal.acceptedByUsername ?? "escrow admin")}`
-    : "";
+  const acceptedByUser = deal.acceptedAt && deal.acceptedBy
+    ? await userService.findById(deal.acceptedBy).catch(() => null)
+    : null;
+  const acceptedByLine = acceptedByUser
+    ? `\nAccepted by: ${userMention(acceptedByUser.telegramId, acceptedByUser.username)}`
+    : (deal.acceptedAt && deal.acceptedBy
+      ? `\nAccepted by: ${userMention(undefined, deal.acceptedByUsername ?? "escrow admin")}`
+      : "");
 
   const kb = groupCardKeyboard(deal);
 
@@ -683,7 +693,7 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
     await ctx.api.editMessageText(
       deal.groupChatId,
       deal.groupMessageId,
-      buildDealCard(deal, buyer?.username ?? null, seller?.username ?? null, status + acceptedByLine),
+      buildDealCard(deal, buyer, seller, status + acceptedByLine),
       { parse_mode: "HTML", reply_markup: kb }
     );
   } catch (e) {

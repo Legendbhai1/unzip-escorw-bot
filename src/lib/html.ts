@@ -13,3 +13,19 @@ export function esc(value: unknown): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+/**
+ * Build a clickable Telegram user mention (`tg://user?id=…`) for HTML-mode
+ * messages. In groups a plain `@username` is only a link when the bot is an
+ * admin AND the user has a public username; `tg://user` links always work.
+ * Falls back to a plain @username (escaped) when the numeric id is unknown.
+ */
+export function userMention(
+  telegramId: bigint | number | string | null | undefined,
+  username: string | null | undefined,
+  fallback = "N/A"
+): string {
+  const label = username ? `@${esc(username)}` : esc(fallback);
+  if (telegramId === null || telegramId === undefined || telegramId === "") return label;
+  return `<a href="tg://user?id=${String(telegramId)}">${label}</a>`;
+}
