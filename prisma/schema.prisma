@@ -523,13 +523,20 @@ model EscrowAuditLog {
 // fallback when a setting has not been entered yet.
 
 model AdminSetting {
-  key       String    @id @db.VarChar(64)
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key       String    @db.VarChar(64)
+  // The authorized escrow group this setting belongs to. "" = the global
+  // fallback used by groups that have not configured their own details.
+  // Each authorized group may have its OWN UPI ID / UPI name / USDT BEP20
+  // receiving address — a deal in group A never uses group B's details.
+  groupId   String    @default("") @map("group_id") @db.VarChar(64)
   value     String    @db.Text
   updatedBy String?   @map("updated_by") @db.Uuid
   updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
 
   admin User? @relation(fields: [updatedBy], references: [id])
 
+  @@unique([key, groupId])
   @@map("admin_settings")
 }
 

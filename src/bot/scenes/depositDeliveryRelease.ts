@@ -291,7 +291,11 @@ export async function handleDispute(ctx: Ctx, dealId: string) {
     `<b>OPEN DISPUTE</b>\n\nOpening a dispute will freeze the deal.\n\nPlease explain the issue:`,
     { reply_markup: backToMain }
   );
+  // Chat-bind the capture: only a message typed in the chat where the prompt
+  // was sent may become the dispute reason — a message typed in any other
+  // chat must never be interpreted by this old question.
   ctx.session.pendingDisputeDealId = dealId;
+  ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 }
 
 export async function handleDisputeReason(ctx: Ctx, reason: string) {
@@ -310,4 +314,5 @@ export async function handleDisputeReason(ctx: Ctx, reason: string) {
   }
 
   delete ctx.session.pendingDisputeDealId;
+  delete ctx.session.pendingFlowChatId;
 }

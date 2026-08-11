@@ -7,7 +7,8 @@ import type { MyContext } from "./context.js";
 import { logger } from "../lib/logger.js";
 import { esc, userMention } from "../lib/html.js";
 import { formatMoney, bpsToPercent } from "../lib/money.js";
-import { getPaymentInstructionsText, getAdminSetting, SETTING_KEYS } from "../lib/paymentInstructions.js";
+import { getPaymentInstructionsText, getAdminSetting, setAdminSetting, deleteAdminSetting, SETTING_KEYS, GLOBAL_GROUP_ID } from "../lib/paymentInstructions.js";
+import { isDealChatValid } from "../lib/flow.js";
 import { updateGroupDealCard } from "./scenes/dealForm.js";
 import { userService } from "../services/userService.js";
 import { groupService } from "../services/groupService.js";
@@ -215,8 +216,16 @@ export async function handleAdminCallback(ctx: MyContext) {
 
   // Server-side authorization — never trust callback data.
   const dealPrefix = DEAL_SCOPED_PREFIXES.find((p) => data.startsWith(p));
+  const settingsScope = settingsScopeOf(data);
   let authorized = false;
-  if (dealPrefix) {
+  if (settingsScope) {
+    // Payment settings: group-scoped panels may be edited by the bot owner, a
+    // global admin, or an ACTIVE escrow admin of THAT group; global panels
+    // remain global-admin only.
+    authorized = settingsScope.groupId === GLOBAL_GROUP_ID
+      ? config.adminTelegramIds.has(ctx.from.id)
+      : await groupService.isAuthorizedForGroup(ctx.from.id, settingsScope.groupId);
+  } else if (dealPrefix) {
     const dealId = data.split(":")[2];
     authorized = await isAuthorizedForDealAction(ctx.from.id, dealId);
   } else {
@@ -228,49 +237,58 @@ export async function handleAdminCallback(ctx: MyContext) {
   }
 
   // ── Payment settings (admin-entered escrow receiving details) ──
-  if (data === "admin:settings") {
-    await showSettings(ctx);
-    await ctx.answerCallbackQuery();
-    return;
-  }
-  if (data.startsWith("admin:settings:set:")) {
-    const key = data.replace("admin:settings:set:", "");
-    ctx.session.pendingSettingKey = key;
-    await ctx.editMessageText(
-      `Enter the new value for <b>${esc(settingLabel(key))}</b>.\n\n` +
-      `Current: <code>${esc((await getAdminSetting(key)) || "— not set —")}</code>\n\n` +
-      `Send <code>/cancel</code> to abort.`
-    );
-    return;
-  }
+  if (settingsScope) {
+    const groupId = settingsScope.groupId;
+    if (data === "admin:settings") {
+      await showSettings(ctx, groupId);
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    if (data.startsWith("admin:settings:set_g:") || data.startsWith("admin:settings:set:")) {
+      const key = data.startsWith("admin:settings:set_g:")
+        ? data.slice(data.lastIndexOf(":") + 1)
+        : data.replace("admin:settings:set:", "");
+      ctx.session.pendingSettingKey = key;
+      ctx.session.pendingSettingGroupId = groupId;
+      ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
+      await ctx.editMessageText(
+        `Enter the new value for <b>${esc(settingLabel(key))}</b> for ` +
+        `${groupId ? `group <code>${esc(groupId)}</code>` : "the global fallback"}.\n\n` +
+        `Current: <code>${esc((await getAdminSetting(key, groupId)) || "— not set —")}</code>\n\n` +
+        `Send <code>/cancel</code> to abort.`
+      );
+      return;
+    }
 
-  // ── View payment methods / Remove USDT address ──
-  if (data === "admin:settings:view_methods") {
-    const [upiId, upiName, usdt] = await Promise.all([
-      getAdminSetting(SETTING_KEYS.upiId),
-      getAdminSetting(SETTING_KEYS.upiName),
-      getAdminSetting(SETTING_KEYS.usdtBep20Address),
-    ]);
-    await ctx.editMessageText(
-      "<b>PAYMENT METHODS</b>\n\n" +
-      `💰 <b>INR / UPI</b>: ${upiId || upiName ? "✅ Configured" : "❌ Not configured"}\n` +
-      `🪙 <b>USDT BEP20</b>: ${usdt ? "✅ Configured" : "❌ Not configured"}\n\n` +
-      "Only these two methods are supported. The bot never generates or derives addresses — " +
-      "the escrower's own receiving details are entered manually.",
-      { reply_markup: new InlineKeyboard().text("Back", "admin:settings") }
-    );
-    return;
-  }
+    // ── View payment methods / Remove USDT address (scoped to this group) ──
+    if (data === "admin:settings:view_methods" || data.startsWith("admin:settings:view_methods_g:")) {
+      const [upiId, upiName, usdt] = await Promise.all([
+        getAdminSetting(SETTING_KEYS.upiId, groupId),
+        getAdminSetting(SETTING_KEYS.upiName, groupId),
+        getAdminSetting(SETTING_KEYS.usdtBep20Address, groupId),
+      ]);
+      await ctx.editMessageText(
+        "<b>PAYMENT METHODS</b>\n\n" +
+        (groupId ? `Scope: <b>group <code>${esc(groupId)}</code></b>\n\n` : `Scope: <b>global</b>\n\n`) +
+        `💰 <b>INR / UPI</b>: ${upiId || upiName ? "✅ Configured" : "❌ Not configured"}\n` +
+        `🪙 <b>USDT BEP20</b>: ${usdt ? "✅ Configured" : "❌ Not configured"}\n\n` +
+        "Only these two methods are supported. The bot never generates or derives addresses — " +
+        "the escrower's own receiving details are entered manually.",
+        { reply_markup: new InlineKeyboard().text("Back", groupId ? `admin:settings_g:${groupId}` : "admin:settings") }
+      );
+      return;
+    }
 
-  if (data === "admin:settings:remove_usdt") {
-    await prisma.adminSetting.deleteMany({ where: { key: SETTING_KEYS.usdtBep20Address } });
-    logger.info({ adminUserId: ctx.session.userId }, "Admin removed the USDT BEP20 escrow address");
-    await ctx.editMessageText(
-      "🗑 <b>USDT BEP20 address removed.</b>\n\n" +
-      "Users will see \"Payment method is currently unavailable\" until a new address is set.",
-      { reply_markup: new InlineKeyboard().text("Back", "admin:settings") }
-    );
-    return;
+    if (data === "admin:settings:remove_usdt" || data.startsWith("admin:settings:remove_usdt_g:")) {
+      await deleteAdminSetting(SETTING_KEYS.usdtBep20Address, groupId);
+      logger.info({ adminUserId: ctx.session.userId, groupId }, "Admin removed the USDT BEP20 escrow address");
+      await ctx.editMessageText(
+        "🗑 <b>USDT BEP20 address removed.</b>\n\n" +
+        "Users will see \"Payment method is currently unavailable\" until a new address is set.",
+        { reply_markup: new InlineKeyboard().text("Back", groupId ? `admin:settings_g:${groupId}` : "admin:settings") }
+      );
+      return;
+    }
   }
 
   // ── Admin accepts a deal from the group card ──────────────────
@@ -372,6 +390,7 @@ export async function handleAdminCallback(ctx: MyContext) {
         `Send the payment reference (optional) or <code>/skip</code>:`
       );
       ctx.session.pendingPaymentReferenceDealId = did;
+      ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 
       // Notify both users in DM: payment verified by escrow admin.
       if (deal) {
@@ -407,6 +426,7 @@ export async function handleAdminCallback(ctx: MyContext) {
   if (data.startsWith("admin:reject_payment:")) {
     const did = data.split(":")[2];
     ctx.session.pendingRejectPaymentDealId = did;
+    ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
     await ctx.editMessageText(
       "Rejecting the payment report for this deal.\n\n" +
       "Enter the <b>reason</b> (the buyer will be told why):"
@@ -475,6 +495,7 @@ export async function handleAdminCallback(ctx: MyContext) {
         `Send the payout reference (optional) or <code>/skip</code>:`
       );
       ctx.session.pendingPayoutReferenceDealId = did;
+      ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 
       if (deal) {
         const msg = complete
@@ -758,52 +779,84 @@ function settingLabel(key: string): string {
   return map[key] ?? key;
 }
 
-async function showSettings(ctx: MyContext) {
-  const [upiId, upiName, usdt, groupId] = await Promise.all([
-    getAdminSetting(SETTING_KEYS.upiId),
-    getAdminSetting(SETTING_KEYS.upiName),
-    getAdminSetting(SETTING_KEYS.usdtBep20Address),
-    getAdminSetting(SETTING_KEYS.escrowGroupId),
-  ]);
+/**
+ * The group scope a settings callback refers to, or null when the callback is
+ * not a payment-settings callback. "" (GLOBAL_GROUP_ID) = the global fallback.
+ */
+function settingsScopeOf(data: string): { groupId: string } | null {
+  if (data === "admin:settings" || data.startsWith("admin:settings_g:")) {
+    if (data.startsWith("admin:settings_g:")) return { groupId: data.slice("admin:settings_g:".length) };
+    return { groupId: GLOBAL_GROUP_ID };
+  }
+  if (data.startsWith("admin:settings:set_g:")) {
+    const rest = data.slice("admin:settings:set_g:".length);
+    const i = rest.lastIndexOf(":");
+    if (i > 0) return { groupId: rest.slice(0, i) };
+    return null;
+  }
+  if (data.startsWith("admin:settings:set:")) return { groupId: GLOBAL_GROUP_ID };
+  if (data.startsWith("admin:settings:view_methods_g:")) return { groupId: data.slice("admin:settings:view_methods_g:".length) };
+  if (data === "admin:settings:view_methods") return { groupId: GLOBAL_GROUP_ID };
+  if (data.startsWith("admin:settings:remove_usdt_g:")) return { groupId: data.slice("admin:settings:remove_usdt_g:".length) };
+  if (data === "admin:settings:remove_usdt") return { groupId: GLOBAL_GROUP_ID };
+  return null;
+}
 
-  await ctx.editMessageText(
+/** Build the payment-settings panel text + keyboard for a scope. */
+export async function buildSettingsPanel(groupId: string, groupTitle?: string) {
+  const [upiId, upiName, usdt] = await Promise.all([
+    getAdminSetting(SETTING_KEYS.upiId, groupId),
+    getAdminSetting(SETTING_KEYS.upiName, groupId),
+    getAdminSetting(SETTING_KEYS.usdtBep20Address, groupId),
+  ]);
+  const isGlobal = groupId === GLOBAL_GROUP_ID;
+  const scopeLine = isGlobal
+    ? "<b>GLOBAL</b> — used by groups that have not set their own details"
+    : `Group: <b>${esc(groupTitle ?? groupId)}</b> — used for deals posted to this group`;
+  const groupVariant = isGlobal ? "" : `_g:${groupId}`;
+  const backData = isGlobal ? "admin:settings" : `admin:settings_g:${groupId}`;
+
+  const keyboard = new InlineKeyboard()
+    .text("Set UPI ID", `admin:settings:set${groupVariant}:${SETTING_KEYS.upiId}`)
+    .text("Set UPI Name", `admin:settings:set${groupVariant}:${SETTING_KEYS.upiName}`)
+    .row()
+    .text("Set USDT BEP20 Address", `admin:settings:set${groupVariant}:${SETTING_KEYS.usdtBep20Address}`);
+  if (isGlobal) {
+    keyboard.row().text("Set Escrow Group ID", `admin:settings:set:${SETTING_KEYS.escrowGroupId}`);
+  }
+  keyboard
+    .row()
+    .text("\u{1F50D}  View Payment Methods", `admin:settings:view_methods${groupVariant}`)
+    .text("\u{1F5D1}\u{FE0F}  Remove USDT Address", `admin:settings:remove_usdt${groupVariant}`)
+    .row()
+    .text("\u{1F3E0}  Main Menu", "menu:main");
+
+  const text =
     "<b>PAYMENT SETTINGS</b>\n\n" +
+    `Scope: ${scopeLine}\n\n` +
     "These are the escrower's own receiving details — manually entered here, " +
-    "never generated by the bot. Only authorized admins can change them.\n\n" +
+    "never generated by the bot. Only the bot owner, a global admin or this " +
+    "group's escrow admin can change them.\n\n" +
     `💰 <b>INR / UPI</b>\n` +
     `UPI ID: <code>${esc(upiId || "— not set —")}</code>\n` +
     `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
     `🪙 <b>USDT BEP20</b>\n` +
     `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
-    `👥 <b>Escrow group</b>\n` +
-    `Chat id: <code>${esc(groupId || "— not set —")}</code> — new deal cards are posted here.\n\n` +
-    `If a payment method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("Set UPI ID", `admin:settings:set:${SETTING_KEYS.upiId}`)
-        .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
-        .row()
-        .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
-        .row()
-        .text("Set Escrow Group ID", `admin:settings:set:${SETTING_KEYS.escrowGroupId}`)
-        .row()
-        .text("\u{1F50D}  View Payment Methods", "admin:settings:view_methods")
-        .text("\u{1F5D1}\u{FE0F}  Remove USDT Address", "admin:settings:remove_usdt")
-        .row()
-        .text("\u{1F3E0}  Main Menu", "menu:main"),
-    }
-  );
+    `If a payment method has no details here, the global fallback (if any) is used; ` +
+    `otherwise users see \"Payment method is currently unavailable. Please contact an admin.\"`;
+
+  return { text, keyboard };
+}
+
+async function showSettings(ctx: MyContext, groupId: string = GLOBAL_GROUP_ID, groupTitle?: string) {
+  const panel = await buildSettingsPanel(groupId, groupTitle);
+  await ctx.editMessageText(panel.text, { reply_markup: panel.keyboard });
 }
 
 /** Persist an admin-entered setting (called from the text message handler). */
-export async function setSettingValue(key: string, value: string, adminUserId: string) {
-  const clean = value.trim();
-  await prisma.adminSetting.upsert({
-    where: { key },
-    create: { key, value: clean, updatedBy: adminUserId },
-    update: { value: clean, updatedBy: adminUserId },
-  });
-  logger.info({ key, adminUserId }, "Admin payment setting updated");
+export async function setSettingValue(key: string, value: string, adminUserId: string, groupId: string = GLOBAL_GROUP_ID) {
+  await setAdminSetting(key, value, adminUserId, groupId);
+  logger.info({ key, groupId, adminUserId }, "Admin payment setting updated");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -887,8 +940,8 @@ async function acceptDealFromGroup(ctx: MyContext, dealId: string) {
       await ctx.answerCallbackQuery("This group is not approved for escrow operations.").catch(() => {});
       return;
     }
-    const chatId = ctx.callbackQuery?.message?.chat?.id;
-    if (chatId && String(chatId) !== deal.groupChatId) {
+    const cbChat = ctx.callbackQuery?.message?.chat;
+    if (cbChat && !isDealChatValid(cbChat.type, cbChat.id, deal.groupChatId)) {
       await ctx.answerCallbackQuery("This deal belongs to another group.").catch(() => {});
       return;
     }
@@ -932,6 +985,7 @@ async function markReleaseComplete(ctx: MyContext, dealId: string) {
       `Send the payout reference (optional) or <code>/skip</code>:`
     );
     ctx.session.pendingPayoutReferenceDealId = dealId;
+    ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 
     if (deal) {
       const msg = complete
@@ -964,6 +1018,7 @@ async function markRefundComplete(ctx: MyContext, dealId: string) {
       `Send the refund reference (optional) or <code>/skip</code>:`
     );
     ctx.session.pendingRefundReferenceDealId = dealId;
+    ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 
     if (deal) {
       const msg = complete

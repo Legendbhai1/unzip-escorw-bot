@@ -161,8 +161,8 @@ describe("Payment instructions (admin settings / env fallback, never generated)"
 
   it("DB admin settings override the env fallback", async () => {
     await prisma.adminSetting.upsert({
-      where: { key: "upi_id" },
-      create: { key: "upi_id", value: "db-admin@upi.example", updatedBy: ADMIN_ID },
+      where: { key_groupId: { key: "upi_id", groupId: "" } },
+      create: { key: "upi_id", groupId: "", value: "db-admin@upi.example", updatedBy: ADMIN_ID },
       update: { value: "db-admin@upi.example" },
     });
     const text = await getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });

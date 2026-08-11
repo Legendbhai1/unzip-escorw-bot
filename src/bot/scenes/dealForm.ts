@@ -10,10 +10,8 @@ import { logger } from "../../lib/logger.js";
 import { esc, userMention } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import { parseDurationDeadline } from "../../lib/dealTerms.js";
-import {
-  paymentMethodSelect, roleSelect, cryptoPayerSelect, categorySelect,
-  formConfirm, activeFormOptions, backToMain,
-} from "../keyboards/index.js";
+import { newFlowToken, isFlowExpired, isFlowChatValid, isDealChatValid, splitCallbackToken, FLOW_TTL_MS } from "../../lib/flow.js";
+import { activeFormOptions, backToMain } from "../keyboards/index.js";
 import type { MyContext } from "../context.js";
 
 /**
@@ -53,6 +51,114 @@ function clearForm(ctx: MyContext) {
   s.createDealDuration = undefined;
   s.createDealReleaseCondition = undefined;
   s.createDealRefundCondition = undefined;
+  s.createDealTargetGroupId = undefined;
+  s.flowToken = undefined;
+  s.flowChatId = undefined;
+  s.flowExpiresAt = undefined;
+}
+
+// ── Flow/state hardening ────────────────────────────────────────────
+// The deal form is ONE authoritative interactive flow per user, bound to the
+// chat where it started. A version TOKEN is rotated on every step advance and
+// embedded in the callback data of the buttons the bot renders, so buttons
+// from older messages carry an older token and are rejected with
+// "This button has expired." — they can never restart or rewind the flow.
+// Free text is only consumed in the flow's chat and while the flow is fresh.
+
+/** Tokenized inline keyboards for the button-driven form steps. */
+function formKeyboard(step: DealFormStep, token: string): InlineKeyboard {
+  switch (step) {
+    case "payment_method":
+      return new InlineKeyboard()
+        .text("\u{1F4B3}  INR / UPI", `form:payment:INR:v${token}`)
+        .row()
+        .text("\u{1FA99}  USDT (BEP20)", `form:payment:USDT:v${token}`)
+        .row()
+        .text("\u{274C}  Cancel", "menu:main");
+    case "role":
+      return new InlineKeyboard()
+        .text("\u{1F6D2}  I'm Buying", `form:role:buyer:v${token}`)
+        .row()
+        .text("\u{1F4BC}  I'm Selling", `form:role:seller:v${token}`)
+        .row()
+        .text("\u{274C}  Cancel", "menu:main");
+    case "crypto_payer":
+      return new InlineKeyboard()
+        .text("\u{1F6D2}  Buyer pays", `form:crypto_payer:BUYER:v${token}`)
+        .row()
+        .text("\u{1F4BC}  Seller pays", `form:crypto_payer:SELLER:v${token}`)
+        .row()
+        .text("\u{274C}  Cancel", "menu:main");
+    case "category":
+      return new InlineKeyboard()
+        .text("Freelance Services", `form:cat:FREELANCE_SERVICES:v${token}`)
+        .row()
+        .text("Physical Goods", `form:cat:PHYSICAL_GOODS:v${token}`)
+        .row()
+        .text("Gift Cards", `form:cat:GIFT_CARDS:v${token}`)
+        .row()
+        .text("Other Lawful", `form:cat:OTHER_LAWFUL:v${token}`)
+        .row()
+        .text("\u{274C}  Cancel", "menu:main");
+    case "preview":
+      return new InlineKeyboard()
+        .text("\u{2705}  Confirm & Post", `form:confirm:v${token}`)
+        .text("\u{270F}\u{FE0F}  Edit", `form:edit:v${token}`)
+        .row()
+        .text("\u{274C}  Cancel", "menu:main");
+    default:
+      return backToMain;
+  }
+}
+
+/** The step a token-stamped callback may drive (text steps have no buttons). */
+export const STEP_FOR_ACTION: Record<string, DealFormStep> = {
+  "form:payment:INR": "payment_method",
+  "form:payment:USDT": "payment_method",
+  "form:role:buyer": "role",
+  "form:role:seller": "role",
+  "form:crypto_payer:BUYER": "crypto_payer",
+  "form:crypto_payer:SELLER": "crypto_payer",
+  "form:confirm": "preview",
+};
+
+/**
+ * Is a deal-form callback valid RIGHT NOW? A button is only valid when:
+ *   - it drives the step the form is currently on (a stale button from an
+ *     earlier step is rejected), and
+ *   - it carries the version token that was stamped when its prompt was
+ *     rendered (the token rotates on every step advance, so buttons from
+ *     older messages carry an older token and are rejected), and
+ *   - the form is still active.
+ * Static navigation callbacks (continue/restart/edit, menu) are always safe.
+ */
+export function isFormCallbackCurrent(
+  data: string,
+  currentStep: string | undefined,
+  flowToken: string | undefined
+): boolean {
+  if (!currentStep) return false;
+  const { action, token } = splitCallbackToken(data);
+  const expectedStep = action.startsWith("form:cat:") ? "category" : STEP_FOR_ACTION[action];
+  if (!expectedStep) return true; // static navigation — safe in any state
+  return Boolean(token) && token === flowToken && currentStep === expectedStep;
+}
+
+/** Start a fresh interactive flow: new token, bound to this chat, with TTL. */
+function beginFlow(ctx: MyContext): string {
+  const s = ctx.session;
+  s.flowToken = newFlowToken();
+  s.flowChatId = String(ctx.chat?.id ?? "");
+  s.flowExpiresAt = Date.now() + FLOW_TTL_MS;
+  return s.flowToken;
+}
+
+/** Rotate the flow token after a step advances. Returns the new token. */
+function advanceFlow(ctx: MyContext): string {
+  const s = ctx.session;
+  s.flowToken = newFlowToken();
+  s.flowExpiresAt = Date.now() + FLOW_TTL_MS;
+  return s.flowToken;
 }
 
 export function paymentLabel(method?: string): string {
@@ -90,26 +196,76 @@ export function renderCurrentStep(ctx: MyContext): string | null {
   }
 }
 
+/** Abandon any other pending capture so the deal form is the ONE authoritative
+ *  interactive flow for this user (see the flow-hardening section above). */
+function abandonOtherFlows(ctx: MyContext) {
+  const s = ctx.session;
+  s.pendingPaymentReportDealId = undefined;
+  s.pendingEvidenceDealId = undefined;
+  s.pendingRejectPaymentDealId = undefined;
+  s.pendingPaymentReferenceDealId = undefined;
+  s.pendingPayoutReferenceDealId = undefined;
+  s.pendingRefundReferenceDealId = undefined;
+  s.pendingSettingKey = undefined;
+  s.pendingSettingGroupId = undefined;
+  s.pendingDisputeDealId = undefined;
+  s.pendingJoinDealId = undefined;
+  s.pendingFlowChatId = undefined;
+}
+
+function isGroupChat(ctx: MyContext): boolean {
+  return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+}
+
 /** Entry point: [Create Deal] button, /form command and "form" text. */
 export async function startDealForm(ctx: MyContext) {
-  // If a form is already active, handle it predictably instead of silently
-  // swallowing messages: offer continue / restart / cancel.
-  if (ctx.session.createDealStep) {
-    await ctx.reply(
-      "You already have an <b>active deal form</b>.\n\n" +
-      "You can continue where you left off, restart it, or cancel.",
-      { reply_markup: activeFormOptions() }
-    );
-    return;
+  abandonOtherFlows(ctx);
+
+  // ── Group-first: a deal form started inside a group is bound to that
+  // group. An unauthorized group is refused immediately (no form steps are
+  // wasted) — deal cards are only posted to groups approved via /allowgroup.
+  // The approved group where the form runs becomes the deal's home: the
+  // finished card is posted to THIS group, not some other configured one.
+  if (isGroupChat(ctx)) {
+    const groupId = String(ctx.chat?.id ?? "");
+    if (!groupId || !(await groupService.isGroupApproved(groupId))) {
+      await ctx.reply(
+        "⚠️ <b>GROUP NOT AUTHORIZED</b>\n\n" +
+        "This group is not authorized for escrow operations.\n\n" +
+        "The bot owner must add the bot here and run <code>/allowgroup</code> inside this group before deals can be created."
+      );
+      return;
+    }
+    ctx.session.createDealTargetGroupId = groupId;
+  } else {
+    ctx.session.createDealTargetGroupId = undefined;
   }
 
+  // If a form is already active, handle it predictably instead of silently
+  // swallowing messages: offer continue / restart / cancel. An EXPIRED form
+  // is discarded silently and a fresh one is started.
+  if (ctx.session.createDealStep) {
+    if (isFlowExpired(ctx.session.flowExpiresAt)) {
+      clearForm(ctx);
+    } else {
+      await ctx.reply(
+        "You already have an <b>active deal form</b>.\n\n" +
+        "You can continue where you left off, restart it, or cancel.",
+        { reply_markup: activeFormOptions() }
+      );
+      return;
+    }
+  }
+
+  // New authoritative flow: fresh token bound to this chat, with a TTL.
+  const token = beginFlow(ctx);
   ctx.session.createDealStep = "payment_method";
   await ctx.reply(
     "<b>CREATE DEAL</b>\n\nChoose the <b>payment method</b>:\n\n" +
     "1. <b>INR / UPI</b> — pay the escrower via UPI\n" +
     "2. <b>USDT (BEP20)</b> — pay the escrower in USDT on BEP20\n\n" +
     "The escrower personally verifies the payment — the bot never holds funds.",
-    { reply_markup: paymentMethodSelect }
+    { reply_markup: formKeyboard("payment_method", token) }
   );
 }
 
@@ -117,36 +273,48 @@ export async function startDealForm(ctx: MyContext) {
 export async function processDealFormCallback(ctx: MyContext, data: string): Promise<boolean> {
   const s = ctx.session;
 
-  // ── Continue / restart / cancel active form ──
-  if (data === "form:continue") {
+  // ── Expired flow: abandon and stop consuming stale callbacks. ──
+  if (s.createDealStep && isFlowExpired(s.flowExpiresAt)) {
+    clearForm(ctx);
+    await ctx.answerCallbackQuery("This form has expired. Please start again.").catch(() => {});
+    return true;
+  }
+
+  const { action } = splitCallbackToken(data);
+
+  // ── Continue / restart / cancel active form (static navigation, safe) ──
+  if (action === "form:continue") {
     if (!s.createDealStep) {
       await startDealForm(ctx);
       return true;
     }
     const prompt = renderCurrentStep(ctx);
-    const kb =
-      s.createDealStep === "payment_method" ? paymentMethodSelect
-      : s.createDealStep === "role" ? roleSelect
-      : s.createDealStep === "crypto_payer" ? cryptoPayerSelect
-      : s.createDealStep === "category" ? categorySelect
-      : backToMain;
+    const kb = formKeyboard(s.createDealStep as DealFormStep, s.flowToken ?? "");
     await ctx.reply(prompt ?? "<b>CREATE DEAL</b>", { reply_markup: kb });
     return true;
   }
-  if (data === "form:restart") {
+  if (action === "form:restart") {
     clearForm(ctx);
     await startDealForm(ctx);
     return true;
   }
-  if (data === "form:edit") {
+  if (action === "form:edit") {
     clearForm(ctx);
     await startDealForm(ctx);
     return true;
   }
 
+  // ── Step-choice callbacks: the button must carry the token stamped when its
+  // prompt was rendered. The token rotates on every step advance, so a button
+  // from an older message is stale — reject it and change nothing. ──
+  if (!isFormCallbackCurrent(data, s.createDealStep, s.flowToken)) {
+    await ctx.answerCallbackQuery("This button has expired. Please use the latest deal message.").catch(() => {});
+    return true;
+  }
+
   // ── Payment method (INR / UPI or USDT BEP20 only) ──
-  if (data === "form:payment:INR" || data === "form:payment:USDT") {
-    const isUsdt = data === "form:payment:USDT";
+  if (action === "form:payment:INR" || action === "form:payment:USDT") {
+    const isUsdt = action === "form:payment:USDT";
     s.createDealPaymentMethod = isUsdt ? "CRYPTO" : "INR";
     if (isUsdt) {
       s.createDealAsset = "USDT";
@@ -155,16 +323,17 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     s.createDealStep = "role";
     await ctx.editMessageText(
       "<b>CREATE DEAL</b>\n\nPayment method: <b>" + paymentLabel(s.createDealPaymentMethod) + "</b>\n\nChoose your <b>role</b>:",
-      { reply_markup: roleSelect }
+      { reply_markup: formKeyboard("role", advanceFlow(ctx)) }
     );
     return true;
   }
 
   // ── Role ──
-  if (data === "form:role:buyer" || data === "form:role:seller") {
-    const role = data === "form:role:buyer" ? "buyer" : "seller";
+  if (action === "form:role:buyer" || action === "form:role:seller") {
+    const role = action === "form:role:buyer" ? "buyer" : "seller";
     s.createDealRole = role;
     s.createDealStep = "counterparty";
+    advanceFlow(ctx);
     await ctx.editMessageText(
       `You are the <b>${role === "buyer" ? "Buyer" : "Seller"}</b>.\n\n` +
       `Enter the other party's Telegram username:\n\n<i>Example: @username</i>`,
@@ -174,21 +343,22 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
   }
 
   // ── Crypto payer (USDT only — bot only records who pays) ──
-  if (data === "form:crypto_payer:BUYER" || data === "form:crypto_payer:SELLER") {
-    s.createDealCryptoPayer = data.endsWith("SELLER") ? "SELLER" : "BUYER";
+  if (action === "form:crypto_payer:BUYER" || action === "form:crypto_payer:SELLER") {
+    s.createDealCryptoPayer = action.endsWith("SELLER") ? "SELLER" : "BUYER";
     s.createDealStep = "category";
     await ctx.editMessageText(
       `<b>CREATE DEAL</b>\n\nCrypto payer: <b>${s.createDealCryptoPayer === "SELLER" ? "Seller" : "Buyer"}</b>\n\n` +
       "The escrower manually receives and verifies the USDT. The bot only records the payment.\n\n<b>CATEGORY</b>\n\nSelect the trade category:",
-      { reply_markup: categorySelect }
+      { reply_markup: formKeyboard("category", advanceFlow(ctx)) }
     );
     return true;
   }
 
   // ── Category ──
-  if (data.startsWith("form:cat:")) {
-    s.createDealCategory = data.replace("form:cat:", "");
+  if (action.startsWith("form:cat:")) {
+    s.createDealCategory = action.replace("form:cat:", "");
     s.createDealStep = "deal_duration";
+    advanceFlow(ctx);
     await ctx.editMessageText(
       "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
       { reply_markup: backToMain }
@@ -196,14 +366,14 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     return true;
   }
 
-  // ── Preview ──
-  if (data === "form:preview") {
+  // ── Preview (legacy, tokenless) ──
+  if (action === "form:preview") {
     await previewDealForm(ctx);
     return true;
   }
 
   // ── Confirm & create ──
-  if (data === "form:confirm") {
+  if (action === "form:confirm") {
     await createDealFromForm(ctx);
     return true;
   }
@@ -216,6 +386,22 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
   const s = ctx.session;
   const step = s.createDealStep as DealFormStep | undefined;
   if (!step) return false;
+
+  // Chat binding — only the chat where this form started may feed it text.
+  // A message typed in ANY other chat is not consumed by this flow; it passes
+  // through to the remaining handlers untouched.
+  if (!isFlowChatValid(s.flowChatId, String(ctx.chat?.id ?? ""))) return false;
+
+  // Expiry — an abandoned form stops consuming input so an old question can
+  // never interpret a later message.
+  if (isFlowExpired(s.flowExpiresAt)) {
+    clearForm(ctx);
+    await ctx.reply(
+      "Your deal form has expired. Start again with /form or [Create Deal].",
+      { reply_markup: backToMain }
+    );
+    return true;
+  }
 
   // ── Counterparty username ──
   if (step === "counterparty") {
@@ -252,6 +438,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealCounterpartyUsername = otherUser.username ?? normalized;
     s.createDealCounterpartyUserId = otherUser.id;
     s.createDealStep = "amount";
+    advanceFlow(ctx);
     await ctx.reply(
       s.createDealPaymentMethod === "INR"
         ? "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>INR</b>:\n\n<i>Example: 10000</i>"
@@ -281,14 +468,14 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
       await ctx.reply(
         "Who is <b>paying USDT to the escrow</b>?\n\n" +
         "In both cases the escrower manually holds and verifies the real funds — the bot only records the payment.",
-        { reply_markup: cryptoPayerSelect }
+        { reply_markup: formKeyboard("crypto_payer", advanceFlow(ctx)) }
       );
     } else {
       // INR: asset=INR, network=UPI.
       s.createDealAsset = "INR";
       s.createDealNetwork = "UPI";
       s.createDealStep = "category";
-      await ctx.reply("<b>CATEGORY</b>\n\nSelect the trade category:", { reply_markup: categorySelect });
+      await ctx.reply("<b>CATEGORY</b>\n\nSelect the trade category:", { reply_markup: formKeyboard("category", advanceFlow(ctx)) });
     }
     return true;
   }
@@ -301,6 +488,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     }
     s.createDealDescription = text;
     s.createDealStep = "deal_duration";
+    advanceFlow(ctx);
     await ctx.reply(
       "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
       { reply_markup: backToMain }
@@ -316,6 +504,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     }
     s.createDealDuration = text.trim();
     s.createDealStep = "release_condition";
+    advanceFlow(ctx);
     await ctx.reply(
       "<b>RELEASE CONDITION</b>\n\nWhen should the escrowed payment be <b>released to the seller</b>?\n\n<i>Example: After the buyer receives and approves the work</i>",
       { reply_markup: backToMain }
@@ -331,6 +520,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     }
     s.createDealReleaseCondition = text;
     s.createDealStep = "refund_condition";
+    advanceFlow(ctx);
     await ctx.reply(
       "<b>REFUND CONDITION</b>\n\nUnder what circumstances should the <b>buyer receive a refund</b>?\n\n<i>Example: If the seller does not deliver within the agreed duration</i>",
       { reply_markup: backToMain }
@@ -346,6 +536,7 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     }
     s.createDealRefundCondition = text;
     s.createDealStep = "preview";
+    advanceFlow(ctx);
     await previewDealForm(ctx);
     return true;
   }
@@ -403,7 +594,7 @@ export async function previewDealForm(ctx: MyContext) {
     releaseLine +
     refundLine +
     `🔐 Payment is manually verified by the escrower.`,
-    { reply_markup: formConfirm() }
+    { reply_markup: formKeyboard("preview", ctx.session.flowToken ?? "") }
   );
 }
 
@@ -533,7 +724,10 @@ export async function createDealFromForm(ctx: MyContext) {
   try {
     // Only an approved escrow group can host deals — do NOT create the deal
     // if no group is configured/approved (the creator gets a clear message).
-    const targetGroupId = await resolveEscrowGroupId();
+    // Group-first: when the form was started inside an approved escrow group,
+    // the card is posted to THAT group (the deal's home). DM-started forms
+    // fall back to the configured escrow group / first approved group.
+    const targetGroupId = s.createDealTargetGroupId?.trim() || (await resolveEscrowGroupId());
     if (!targetGroupId) {
       await ctx.reply(
         "⚠️ <b>ESCROW GROUP NOT AUTHORIZED</b>\n\n" +
@@ -715,9 +909,10 @@ export async function handleAgreeToDeal(ctx: MyContext, dealId: string) {
       return;
     }
 
-    // The callback must come from the deal's own group (when known).
-    const chatId = ctx.callbackQuery?.message?.chat?.id;
-    if (deal.groupChatId && chatId && String(chatId) !== deal.groupChatId) {
+    // The callback must come from the deal's own group (when known); DM
+    // callbacks are allowed only where the bot sends them.
+    const cbChat = ctx.callbackQuery?.message?.chat;
+    if (cbChat && !isDealChatValid(cbChat.type, cbChat.id, deal.groupChatId)) {
       await ctx.answerCallbackQuery("This deal belongs to another group.").catch(() => {});
       return;
     }

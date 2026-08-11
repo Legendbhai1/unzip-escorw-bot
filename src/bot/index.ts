@@ -18,6 +18,8 @@ import {
 } from "./scenes/dealForm.js";
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
+import { isDealChatValid } from "../lib/flow.js";
+import { canTransition } from "../lib/stateMachine.js";
 import type { MyContext, SessionData } from "./context.js";
 import { adminDashboard, listDisputes, reviewDispute, handleAdminCallback, banUser, suspendUser, lookupUser, setSettingValue } from "./admin.js";
 import { updateGroupDealCard } from "./scenes/dealForm.js";
@@ -199,9 +201,22 @@ bot.command("refund", async (ctx) => {
   await handleRefundCommand(ctx, deal, amount);
 });
 
-// ─── Admin payment settings (admin-only) ────────────────────────────
+// ─── Admin payment settings ────────────────────────────────────────
+// In DM: global admins edit the GLOBAL fallback details. Inside a group: the
+// bot owner, a global admin, or THAT group's escrow admin can configure the
+// group's OWN receiving details (never another group's).
 bot.command("settings", async (ctx) => {
-  if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) {
+  if (!ctx.from) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+  if (isGroupChat(ctx)) {
+    const ok = await groupService.isAuthorizedForGroup(ctx.from.id, String(ctx.chat.id));
+    if (!ok) {
+      await ctx.reply("Unauthorized — only the bot owner, a global admin or this group's escrow admin can change its payment details.");
+      return;
+    }
+  } else if (!config.adminTelegramIds.has(ctx.from.id)) {
     await ctx.reply("Unauthorized.");
     return;
   }
@@ -359,6 +374,25 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
+  // ── Deal-scoped callback chat guard ──
+  // Every deal:* callback that carries a deal id must come from the deal's own
+  // group OR a private chat (the bot sends DM buttons to the parties/admins).
+  // A callback crafted in or forwarded from ANY other group is invalid and is
+  // rejected before any handler runs — it can never act on this deal.
+  const dealAction = data.match(/^deal:(agree|status|paid|evidence|release|release_agree|release_reject|refund_agree|refund_reject|deliver|dispute|cancel):(.+)$/);
+  if (dealAction) {
+    const deal = await dealService.findWithParties(dealAction[2]);
+    if (!deal) {
+      await ctx.answerCallbackQuery("Deal not found.").catch(() => {});
+      return;
+    }
+    const cbChat = ctx.callbackQuery?.message?.chat;
+    if (!isDealChatValid(cbChat?.type, cbChat?.id, deal.groupChatId)) {
+      await ctx.answerCallbackQuery("This action is no longer valid.").catch(() => {});
+      return;
+    }
+  }
+
   // ── Main Menu ──
   if (data === "menu:main") {
     ctx.session.createDealStep = undefined;
@@ -467,7 +501,11 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
     ctx.session.lastDealId = dealId;
+    // One authoritative flow: starting the payment-report capture abandons
+    // any in-progress deal form.
+    ctx.session.createDealStep = undefined;
     ctx.session.pendingPaymentReportDealId = dealId;
+    ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
     await ctx.answerCallbackQuery("Let's record your payment.");
     await ctx.reply(
       `<b>REPORT PAYMENT</b>\n\nDeal #${esc(deal.inviteCode)}\n\n` +
@@ -482,7 +520,9 @@ bot.on("callback_query:data", async (ctx) => {
   // ── Deal: Buyer submits requested evidence ──
   if (data.startsWith("deal:evidence:")) {
     const dealId = data.split(":")[2];
+    ctx.session.createDealStep = undefined;
     ctx.session.pendingEvidenceDealId = dealId;
+    ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
     await ctx.answerCallbackQuery("Send your evidence.");
     await ctx.reply(
       "Send a <b>screenshot</b> or describe the payment details as text:",
@@ -578,6 +618,14 @@ bot.on("callback_query:data", async (ctx) => {
 bot.on("message:text", async (ctx, next) => {
   const text = ctx.message.text.trim();
 
+  // ── Stale text from another chat must not be consumed by a pending capture
+  // state. Only the chat where the prompt was sent may answer it — a message
+  // typed anywhere else passes through untouched. ──
+  if (ctx.session.pendingFlowChatId && String(ctx.chat?.id ?? "") !== ctx.session.pendingFlowChatId) {
+    await next();
+    return;
+  }
+
   // 1. Dispute reason
   if (ctx.session.pendingDisputeDealId) {
     await handleDisputeReason(ctx, text);
@@ -587,21 +635,42 @@ bot.on("message:text", async (ctx, next) => {
   // 2. Buyer reports payment (reference or notes after "I've Paid")
   if (ctx.session.pendingPaymentReportDealId) {
     const dealId = ctx.session.pendingPaymentReportDealId;
-    delete ctx.session.pendingPaymentReportDealId;
-    if (text.toLowerCase() === "/skip") {
-      await completePaymentReport(ctx, dealId, {});
+    // Stale-state check: only consume the message when the deal can still be
+    // reported by this user. If it moved on, drop the capture WITHOUT
+    // consuming the message for the old question.
+    const deal = await dealService.findWithParties(dealId).catch(() => null);
+    const payerRole = deal && dealService.getPayerId(deal) === deal.buyerId ? "BUYER" : "SELLER";
+    if (!deal || !canTransition(deal.status, "PAYMENT_REPORTED", payerRole)) {
+      delete ctx.session.pendingPaymentReportDealId;
+      delete ctx.session.pendingFlowChatId;
     } else {
-      await completePaymentReport(ctx, dealId, { reference: text });
+      delete ctx.session.pendingPaymentReportDealId;
+      delete ctx.session.pendingFlowChatId;
+      if (text.toLowerCase() === "/skip") {
+        await completePaymentReport(ctx, dealId, {});
+      } else {
+        await completePaymentReport(ctx, dealId, { reference: text });
+      }
+      return;
     }
-    return;
   }
 
   // 3. Buyer submits evidence as text
   if (ctx.session.pendingEvidenceDealId) {
     const dealId = ctx.session.pendingEvidenceDealId;
-    delete ctx.session.pendingEvidenceDealId;
-    await submitEvidence(ctx, dealId, text, undefined);
-    return;
+    const { prisma } = await import("../lib/db.js");
+    const pending = await prisma.paymentReport.findFirst({ where: { dealId, status: "PENDING" } }).catch(() => null);
+    const deal = await dealService.findWithParties(dealId).catch(() => null);
+    if (!pending && deal?.status !== "PAYMENT_REPORTED") {
+      // No pending report to attach evidence to — stale capture, do not consume.
+      delete ctx.session.pendingEvidenceDealId;
+      delete ctx.session.pendingFlowChatId;
+    } else {
+      delete ctx.session.pendingEvidenceDealId;
+      delete ctx.session.pendingFlowChatId;
+      await submitEvidence(ctx, dealId, text, undefined);
+      return;
+    }
   }
 
   // 4. Admin: rejection reason
@@ -673,8 +742,20 @@ bot.on("message:text", async (ctx, next) => {
   // 6c. Admin: capture a payment setting value (/settings flow)
   if (ctx.session.pendingSettingKey) {
     const key = ctx.session.pendingSettingKey;
+    const groupId = ctx.session.pendingSettingGroupId ?? "";
     delete ctx.session.pendingSettingKey;
-    if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) {
+    delete ctx.session.pendingSettingGroupId;
+    delete ctx.session.pendingFlowChatId;
+    if (!ctx.from) {
+      await ctx.reply("Unauthorized.");
+      return;
+    }
+    // Authorization is re-checked for the SCOPE this value belongs to:
+    // group details need the bot owner / global admin / that group's admin.
+    const ok = groupId
+      ? await groupService.isAuthorizedForGroup(ctx.from.id, groupId)
+      : config.adminTelegramIds.has(ctx.from.id);
+    if (!ok) {
       await ctx.reply("Unauthorized.");
       return;
     }
@@ -684,12 +765,18 @@ bot.on("message:text", async (ctx, next) => {
     }
     if (text.trim().length < 3 || text.length > 300) {
       ctx.session.pendingSettingKey = key;
+      ctx.session.pendingSettingGroupId = groupId;
+      ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
       await ctx.reply("Value must be between 3 and 300 characters. Please try again (or <code>/cancel</code>):");
       return;
     }
     try {
-      await setSettingValue(key, text, ctx.session.userId);
-      await ctx.reply(`✅ <b>${esc(key.replace(/_/g, " ").toUpperCase())}</b> updated.\n\nUse <code>/settings</code> to review.`);
+      await setSettingValue(key, text, ctx.session.userId, groupId);
+      await ctx.reply(
+        `✅ <b>${esc(key.replace(/_/g, " ").toUpperCase())}</b> updated` +
+        (groupId ? ` for group <code>${esc(groupId)}</code>` : " (global fallback)") +
+        `.\n\nUse <code>/settings</code> to review.`
+      );
     } catch (e: unknown) {
       await ctx.reply(esc(e instanceof Error ? e.message : "Could not save setting"));
     }
@@ -819,66 +906,48 @@ bot.command("admin", adminDashboard);
 
 // ─── Admin: /settings command body ───────────────────────────────────
 async function adminPaymentSettings(ctx: MyContext) {
-  const { prisma } = await import("../lib/db.js");
-  const { getAdminSetting, SETTING_KEYS } = await import("../lib/paymentInstructions.js");
-  const [upiId, upiName, usdt, groupId] = await Promise.all([
-    getAdminSetting(SETTING_KEYS.upiId),
-    getAdminSetting(SETTING_KEYS.upiName),
-    getAdminSetting(SETTING_KEYS.usdtBep20Address),
-    getAdminSetting(SETTING_KEYS.escrowGroupId),
-  ]);
-
-  await ctx.reply(
-    "<b>PAYMENT SETTINGS</b>\n\n" +
-    "These are the escrower's own receiving details — manually entered, never generated by the bot.\n\n" +
-    `💰 <b>INR / UPI</b>\n` +
-    `UPI ID: <code>${esc(upiId || "— not set —")}</code>\n` +
-    `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
-    `🪙 <b>USDT BEP20</b>\n` +
-    `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
-    `👥 <b>Escrow group</b>\n` +
-    `Chat id: <code>${esc(groupId || "— not set —")}</code> — new deal cards are posted here.\n\n` +
-    `If a method has no details, users see \"Payment method is currently unavailable. Please contact an admin.\"`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("Set UPI ID", `admin:settings:set:${SETTING_KEYS.upiId}`)
-        .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
-        .row()
-        .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
-        .row()
-        .text("Set Escrow Group ID", `admin:settings:set:${SETTING_KEYS.escrowGroupId}`)
-        .row()
-        .text("\u{1F50D}  View Payment Methods", "admin:settings:view_methods")
-        .text("\u{1F5D1}\u{FE0F}  Remove USDT Address", "admin:settings:remove_usdt")
-        .row()
-        .text("\u{1F3E0}  Main Menu", "menu:main"),
-    }
-  );
+  const { buildSettingsPanel } = await import("./admin.js");
+  const groupId = isGroupChat(ctx) ? String(ctx.chat?.id ?? "") : "";
+  const panel = await buildSettingsPanel(groupId, groupTitle(ctx));
+  await ctx.reply(panel.text, { reply_markup: panel.keyboard });
 }
 
 /** Resolve the deal a /release or /refund refers to: replied-to deal card,
- *  optional deal code argument, or the last deal the user interacted with. */
-async function resolveDealFromContext(ctx: MyContext, codeArg?: string) {
+ *  optional deal code argument, or the last deal the user interacted with.
+ *
+ *  GROUP-FIRST: when the command runs inside a group, only a deal posted to
+ *  THAT group may be acted on. The reply-to path is already chat-scoped; the
+ *  code-arg / lastDealId fallbacks are ignored when they point at a deal in
+ *  another group — a user cannot drive a Group B deal from Group A. In DM
+ *  the fallbacks work as before (participant checks still apply server-side). */
+export async function resolveDealFromContext(ctx: MyContext, codeArg?: string) {
+  const inGroup = isGroupChat(ctx);
+  const chatId = String(ctx.chat?.id ?? "");
+  let deal: Awaited<ReturnType<typeof dealService.findWithParties>> | null = null;
+
   // 1. Replying to a bot deal card (group or DM).
   const replyTo = ctx.message?.reply_to_message;
   if (replyTo?.message_id && replyTo.from?.is_bot && ctx.chat) {
     const { prisma } = await import("../lib/db.js");
     const byMsg = await prisma.deal.findFirst({
-      where: { groupChatId: String(ctx.chat.id), groupMessageId: replyTo.message_id },
+      where: { groupChatId: chatId, groupMessageId: replyTo.message_id },
     });
-    if (byMsg) return dealService.findWithParties(byMsg.id);
+    if (byMsg) deal = await dealService.findWithParties(byMsg.id);
   }
   // 2. Deal code argument.
-  if (codeArg) {
+  if (!deal && codeArg) {
     const byCode = await dealService.findByInviteCode(codeArg.toUpperCase());
-    if (byCode) return dealService.findWithParties(byCode.id);
+    if (byCode) deal = await dealService.findWithParties(byCode.id);
   }
   // 3. Last deal the user viewed (DM context).
-  if (ctx.session.lastDealId) {
-    const last = await dealService.findWithParties(ctx.session.lastDealId);
-    if (last) return last;
+  if (!deal && ctx.session.lastDealId) {
+    deal = await dealService.findWithParties(ctx.session.lastDealId);
   }
-  return null;
+  // 4. Group gate: a deal from another group is never resolved here.
+  if (deal && inGroup && deal.groupChatId && deal.groupChatId !== chatId) {
+    return null;
+  }
+  return deal;
 }
 bot.command("disputes", listDisputes);
 bot.command("review", reviewDispute);

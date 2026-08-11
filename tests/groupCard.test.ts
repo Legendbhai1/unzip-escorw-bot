@@ -109,8 +109,8 @@ describe("userMention helper", () => {
 describe("escrow group id setting (runtime configurable, env fallback)", () => {
   it("returns the admin-entered escrow_group_id from the DB", async () => {
     await prisma.adminSetting.upsert({
-      where: { key: SETTING_KEYS.escrowGroupId },
-      create: { key: SETTING_KEYS.escrowGroupId, value: "-1001234567890", updatedBy: ADMIN_ID },
+      where: { key_groupId: { key: SETTING_KEYS.escrowGroupId, groupId: "" } },
+      create: { key: SETTING_KEYS.escrowGroupId, groupId: "", value: "-1001234567890", updatedBy: ADMIN_ID },
       update: { value: "-1001234567890", updatedBy: ADMIN_ID },
     });
     expect(await getAdminSetting(SETTING_KEYS.escrowGroupId)).toBe("-1001234567890");

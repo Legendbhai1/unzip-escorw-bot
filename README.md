@@ -60,6 +60,14 @@ and personally pays the seller / refunds the buyer outside the bot.
   `SELLER_FEE_BPS`), shown explicitly in the summary and admin screens.
   E.g. ₹10,000 deal: buyer pays ₹10,100, seller receives ₹9,900, escrower earns
   ₹200. Fees are recorded as `FEE_RECORDED` audit entries.
+- **Stale-button / stale-text protection**: every interactive flow (deal form,
+  payment report, evidence, settings) is ONE authoritative flow per user with
+  a version **token** stamped into the buttons it renders and rotated on every
+  step. Buttons from older messages carry an older token and are rejected with
+  "This button has expired. Please use the latest deal message." — they can
+  never restart or rewind a flow. Free text is only consumed in the chat where
+  the flow started (a message typed in another chat is never interpreted by an
+  old question) and abandoned flows expire after 30 minutes.
 - **Audit**: every financial event (`DEAL_CREATED`, `ADMIN_ACCEPTED`,
   `PAYMENT_INSTRUCTIONS_SENT`, `PAYMENT_REPORTED`, `PAYMENT_VERIFIED`,
   `PAYMENT_REJECTED`, `DELIVERY_MARKED`, `RELEASE_REQUESTED`, `RELEASE_AGREED`,
@@ -91,13 +99,22 @@ and personally pays the seller / refunds the buyer outside the bot.
 ## Payment settings (admin-entered, never generated)
 
 The escrower's receiving details are entered by an authorized admin with
-`/settings` in the bot (stored in the `admin_settings` table). The bot NEVER
-generates or derives an address. If a method has no details, users see:
+`/settings` and stored in the `admin_settings` table. Settings are **scoped per
+authorized escrow group**: each group can have its own UPI ID, UPI name and
+USDT BEP20 receiving address, so different groups (with different escrow
+admins) never show each other's details.
+
+- Running `/settings` **inside a group** edits that group's own details (bot
+  owner, a global admin, or that group's escrow admin only).
+- Running `/settings` **in DM** edits the **global fallback**, which any group
+  without its own details falls back to.
+
+If a method has no details for a group (and no global fallback), users see:
 
 > Payment method is currently unavailable. Please contact an admin.
 
 For deployments that have not entered settings yet, the following env vars are
-used as a **fallback**:
+used as a **deployment-level fallback**:
 
 | Variable | Purpose |
 |---|---|
@@ -118,7 +135,8 @@ CREATE DEAL (button / /form / "form")
   → PAYMENT METHOD (INR / UPI | USDT BEP20)
   → ROLE → COUNTERPARTY → AMOUNT → (USDT: CRYPTO PAYER) → CATEGORY
   → DESCRIPTION → DEAL DURATION → RELEASE CONDITION → REFUND CONDITION → CONFIRM
-  → deal card posted to the APPROVED escrow group (Status: WAITING FOR PARTY AGREEMENT)
+  → deal card posted to the APPROVED escrow group the form ran in
+    (DM forms use the configured escrow group; Status: WAITING FOR PARTY AGREEMENT)
   → BUYER [✅ Agree to Deal] → SELLER [✅ Agree to Deal] (bot records who clicked)
   → BOTH AGREED → Status: WAITING FOR ADMIN → owner + group admins notified
   → GROUP ESCROW ADMIN [🛡 Accept Deal] → AWAITING_PAYMENT (acceptedBy/acceptedAt recorded)
@@ -139,9 +157,12 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
 ## Commands
 
 - `/start` — main menu
-- `/form` or typing `form` — create a deal (runs in a private chat so the
-  multi-step form stays isolated; the finished deal is posted to the escrow
-  group automatically)
+- `/form` or typing `form` — create a deal. **Group-first**: run it inside the
+  authorized escrow group and the finished deal card is posted to that same
+  group (the group where the form ran is the deal's home). Run it in DM and
+  the card goes to the configured escrow group (setting / env / first approved
+  group). The form is refused entirely in a group the owner has not approved
+  with `/allowgroup`
 - `/allowgroup` — authorize the current group for escrow (bot owner only)
 - `/disallowgroup` — disable escrow in the current group, keeping all data
   (bot owner only)
@@ -150,7 +171,9 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
 - `/removeadmin @user` — remove a group-specific escrow admin (bot owner only)
 - `/groupadmins` — list the current group's escrow admins (bot owner only)
 - `/admin` — admin dashboard (global admins only)
-- `/settings` — view/edit escrow payment details (global admins only)
+- `/settings` — view/edit escrow payment details. In DM: the global fallback
+  (global admins only). Inside a group: that group's own details (bot owner /
+  global admin / that group's escrow admin)
 - `/disputes`, `/review`, `/ban`, `/suspend`, `/user` — admin tooling
 - `/release all` | `/release 50` — request a (partial) release; reply to the
   deal message in the group, or use your last viewed deal in DM (optionally
@@ -176,7 +199,9 @@ per group with `/addadmin @user`. Recommended permissions:
     `tg://user?id=…` links, which work without admin rights).
 - Inline-button callbacks on the bot's own deal card work regardless of admin
   status, and sessions are keyed **per user** (not per chat), so members in the
-  same group never share form state or pending flows.
+  same group never share form state or pending flows. Deal-scoped callbacks are
+  also re-checked server-side against the deal's group: a callback crafted in
+  or forwarded from any OTHER group is rejected.
 - The bot posts the deal card itself, so it needs permission to **send
   messages** (and ideally to **edit messages**, which it has for its own
   messages).
