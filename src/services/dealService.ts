@@ -8,6 +8,7 @@ import { HOUSE_USER_ID } from "./treasuryService.js";
 import { config } from "../config/index.js";
 import type { DealStatus, DealCategory, PaymentMethod } from "@prisma/client";
 import { randomUUID } from "node:crypto";
+import { parseDurationDeadline } from "../lib/dealTerms.js";
 
 function generateInviteCode(): string {
   return randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase();
@@ -38,6 +39,11 @@ export const dealService = {
     cryptoPayer?: "BUYER" | "SELLER";
     description: string;
     category: DealCategory;
+    // Deal terms (asked during creation; immutable once posted to the group)
+    dealDuration?: string;
+    dealDeadlineAt?: Date;
+    releaseCondition?: string;
+    refundCondition?: string;
   }) {
     const deal = await prisma.deal.create({
       data: {
@@ -56,6 +62,14 @@ export const dealService = {
         category: input.category,
         status: "CREATED",
         remainingAmount: input.amount,
+        dealDuration: input.dealDuration ?? null,
+        // Informational deadline derived from the free-text duration when not
+        // explicitly provided. Never auto-refunds/releases when it passes.
+        dealDeadlineAt:
+          input.dealDeadlineAt ??
+          (input.dealDuration ? parseDurationDeadline(input.dealDuration) : null),
+        releaseCondition: input.releaseCondition ?? null,
+        refundCondition: input.refundCondition ?? null,
       },
     });
 
@@ -97,6 +111,11 @@ export const dealService = {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
       if (d.accepted_at) throw new Error("This deal has already been accepted");
+      // Both parties must have agreed to the posted deal card before any admin
+      // can accept it. Enforced here (server-side, row-locked), not just in UI.
+      if (!d.buyer_agreed_at || !d.seller_agreed_at) {
+        throw new Error("Both parties must agree to the deal before it can be accepted");
+      }
       const t = canTransition(d.status, "AWAITING_PAYMENT", "ADMIN");
       if (!t) throw new Error(`Cannot accept deal from ${d.status}`);
 
@@ -117,6 +136,51 @@ export const dealService = {
 
       logger.info({ dealId, adminUserId }, "Deal accepted by admin -> AWAITING_PAYMENT");
       return { dealId };
+    });
+  },
+
+  /**
+   * A party agrees to the posted deal terms in the escrow group. The bot
+   * identifies WHO clicked and records the agreement for that party only —
+   * nobody can agree on someone else's behalf. Terms are immutable once
+   * posted; if they ever changed, both parties would need to agree again.
+   * Returns { agreedBy, bothAgreed }.
+   */
+  async agreeToDeal(dealId: string, userId: string) {
+    return prisma.$transaction(async (tx) => {
+      const d = await this._lockDeal(tx, dealId);
+      if (d.status !== "CREATED") throw new Error(`Cannot agree to a deal in ${d.status} state`);
+      if (!d.buyer_id || !d.seller_id) throw new Error("Deal is missing a party");
+
+      const isBuyer = d.buyer_id === userId;
+      const isSeller = d.seller_id === userId;
+      if (!isBuyer && !isSeller) throw new Error("Only the buyer or seller can agree to this deal");
+
+      if (isBuyer) {
+        if (d.buyer_agreed_at) throw new Error("You have already agreed to this deal");
+      } else if (d.seller_agreed_at) {
+        throw new Error("You have already agreed to this deal");
+      }
+
+      await tx.deal.update({
+        where: { id: dealId },
+        data: isBuyer ? { buyerAgreedAt: new Date() } : { sellerAgreedAt: new Date() },
+      });
+
+      await tx.escrowAuditLog.create({
+        data: {
+          dealId,
+          action: "DEAL_AGREED",
+          userId,
+          amount: d.amount,
+          currency: d.currency ?? d.asset,
+          notes: `${isBuyer ? "Buyer" : "Seller"} agreed to the posted deal terms`,
+        },
+      });
+
+      const bothAgreed = Boolean(d.buyer_agreed_at || isBuyer) && Boolean(d.seller_agreed_at || isSeller);
+      logger.info({ dealId, userId, bothAgreed }, "Party agreed to deal terms");
+      return { agreedBy: isBuyer ? "BUYER" : "SELLER", bothAgreed };
     });
   },
 
@@ -162,6 +226,7 @@ export const dealService = {
       Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, network,
         currency, payment_method, crypto_payer, buyer_fee_bps, seller_fee_bps,
         buyer_fee_amount, seller_fee_amount, accepted_at,
+        buyer_agreed_at, seller_agreed_at,
         released_amount, refunded_amount, remaining_amount,
         release_requested_by, release_requested_amount, release_requested_from,
         release_agreed_by, release_agreed_at,

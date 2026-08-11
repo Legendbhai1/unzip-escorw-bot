@@ -1,7 +1,8 @@
 import { Bot, InlineKeyboard, session } from "grammy";
-import { config } from "../config/index.js";
+import { config, isBotOwner } from "../config/index.js";
 import { redis } from "../lib/redis.js";
 import { userService } from "../services/userService.js";
+import { groupService } from "../services/groupService.js";
 import { dealService } from "../services/dealService.js";
 import { notificationService } from "../services/notificationService.js";
 import { mainMenu, backToMain, dealTabs } from "./keyboards/index.js";
@@ -13,6 +14,7 @@ import {
 import { showHistory, showMyDeals } from "./scenes/walletAndDeals.js";
 import {
   startDealForm, processDealFormCallback, processDealFormText,
+  handleAgreeToDeal,
 } from "./scenes/dealForm.js";
 import { logger } from "../lib/logger.js";
 import { esc } from "../lib/html.js";
@@ -197,6 +199,147 @@ bot.command("settings", async (ctx) => {
   await adminPaymentSettings(ctx);
 });
 
+// ─── Group authorization + group escrow admins (bot owner only) ──────
+function isGroupChat(ctx: MyContext): boolean {
+  return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+}
+
+function groupTitle(ctx: MyContext): string | undefined {
+  const chat = ctx.chat as { title?: string } | undefined;
+  return chat?.title;
+}
+
+bot.command("allowgroup", async (ctx) => {
+  if (!ctx.from || !isBotOwner(ctx.from.id)) {
+    await ctx.reply("Only the bot owner can use /allowgroup.");
+    return;
+  }
+  if (!isGroupChat(ctx)) {
+    await ctx.reply("Run this command <b>inside</b> the group you want to authorize.");
+    return;
+  }
+  const groupId = String(ctx.chat.id);
+  await groupService.approveGroup(groupId, groupTitle(ctx), ctx.session.userId);
+  await ctx.reply(
+    `✅ <b>GROUP AUTHORIZED</b>\n\n` +
+    `Group: <b>${esc(groupTitle(ctx) ?? groupId)}</b>\n` +
+    `ID: <code>${esc(groupId)}</code>\n` +
+    `Status: <b>APPROVED</b>\n\n` +
+    `Deal cards can now be posted here and escrow admins can accept deals.\n` +
+    `Assign escrow admins with <code>/addadmin @username</code>.`
+  );
+});
+
+bot.command("disallowgroup", async (ctx) => {
+  if (!ctx.from || !isBotOwner(ctx.from.id)) {
+    await ctx.reply("Only the bot owner can use /disallowgroup.");
+    return;
+  }
+  if (!isGroupChat(ctx)) {
+    await ctx.reply("Run this command <b>inside</b> the group you want to disallow.");
+    return;
+  }
+  const groupId = String(ctx.chat.id);
+  await groupService.disallowGroup(groupId, ctx.session.userId);
+  await ctx.reply(
+    `⚠️ <b>GROUP DISALLOWED</b>\n\n` +
+    `Group: <b>${esc(groupTitle(ctx) ?? groupId)}</b>\n` +
+    `ID: <code>${esc(groupId)}</code>\n` +
+    `Status: <b>DISALLOWED</b>\n\n` +
+    `New deals will not be posted here. Existing deals, users and audit records are <b>untouched</b>.`
+  );
+});
+
+bot.command("addadmin", async (ctx) => {
+  if (!ctx.from || !isBotOwner(ctx.from.id)) {
+    await ctx.reply("Only the bot owner can use /addadmin.");
+    return;
+  }
+  if (!isGroupChat(ctx)) {
+    await ctx.reply("Run /addadmin <b>inside</b> the group you want to assign the admin for.");
+    return;
+  }
+  const username = (ctx.match ?? "").trim().replace(/^@+/, "");
+  if (!username) {
+    await ctx.reply("Usage: <code>/addadmin @username</code>");
+    return;
+  }
+  const groupId = String(ctx.chat.id);
+  if (!(await groupService.isGroupApproved(groupId))) {
+    await ctx.reply("⚠️ This group is not approved yet — run <code>/allowgroup</code> here first.");
+    return;
+  }
+  const user = await userService.findByUsername(username);
+  if (!user) {
+    await ctx.reply(`User <code>@${esc(username)}</code> was not found — they must have started this bot first.`);
+    return;
+  }
+  await groupService.addGroupAdmin(groupId, user.id, ctx.session.userId);
+  await ctx.reply(
+    `✅ <b>GROUP ESCROW ADMIN ADDED</b>\n\n` +
+    `@${esc(user.username ?? user.id)} is now an escrow admin for <b>${esc(groupTitle(ctx) ?? groupId)}</b> only.`
+  );
+});
+
+bot.command("removeadmin", async (ctx) => {
+  if (!ctx.from || !isBotOwner(ctx.from.id)) {
+    await ctx.reply("Only the bot owner can use /removeadmin.");
+    return;
+  }
+  if (!isGroupChat(ctx)) {
+    await ctx.reply("Run /removeadmin <b>inside</b> the group you want to unassign the admin from.");
+    return;
+  }
+  const username = (ctx.match ?? "").trim().replace(/^@+/, "");
+  if (!username) {
+    await ctx.reply("Usage: <code>/removeadmin @username</code>");
+    return;
+  }
+  const user = await userService.findByUsername(username);
+  if (!user) {
+    await ctx.reply(`User <code>@${esc(username)}</code> was not found.`);
+    return;
+  }
+  const groupId = String(ctx.chat.id);
+  const removed = await groupService.removeGroupAdmin(groupId, user.id, ctx.session.userId);
+  if (removed === 0) {
+    await ctx.reply(`@${esc(user.username ?? user.id)} is not an active escrow admin for this group.`);
+    return;
+  }
+  await ctx.reply(`🗑 <b>GROUP ESCROW ADMIN REMOVED</b>\n\n@${esc(user.username ?? user.id)} no longer has escrow powers in <b>${esc(groupTitle(ctx) ?? groupId)}</b>.`);
+});
+
+bot.command("groupadmins", async (ctx) => {
+  if (!ctx.from || !isBotOwner(ctx.from.id)) {
+    await ctx.reply("Only the bot owner can use /groupadmins.");
+    return;
+  }
+  if (!isGroupChat(ctx)) {
+    await ctx.reply("Run /groupadmins <b>inside</b> the group you want to inspect.");
+    return;
+  }
+  const groupId = String(ctx.chat.id);
+  const admins = await groupService.listGroupAdmins(groupId);
+  if (admins.length === 0) {
+    await ctx.reply(
+      `<b>GROUP ESCROW ADMINS</b>\n\n` +
+      `Group: <b>${esc(groupTitle(ctx) ?? groupId)}</b>\n` +
+      `No escrow admins assigned yet. Use <code>/addadmin @username</code>.`
+    );
+    return;
+  }
+  const lines = admins.map((a, i) =>
+    `${i + 1}. @${esc(a.user.username ?? a.user.id)} — assigned ${a.assignedAt.toISOString().slice(0, 10)}`
+  ).join("\n");
+  await ctx.reply(
+    `<b>GROUP ESCROW ADMINS</b>\n\n` +
+    `Group: <b>${esc(groupTitle(ctx) ?? groupId)}</b>\n` +
+    `ID: <code>${esc(groupId)}</code>\n\n` +
+    lines +
+    `\n\nThese escrow admins can accept/verify deals in this group only.`
+  );
+});
+
 // ─── Callback Query Router ─────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -253,14 +396,15 @@ bot.on("callback_query:data", async (ctx) => {
     await ctx.editMessageText(
       "<b>HOW IT WORKS</b>\n\n" +
       "1. Create a deal (button, /form or the word \"form\")\n" +
-      "2. Both parties join and agree to the terms\n" +
-      "3. You get the escrower's payment instructions\n" +
-      "4. Buyer pays the escrower directly (UPI or crypto)\n" +
-      "5. Buyer taps \"I've Paid\"\n" +
-      "6. The escrower personally verifies the payment\n" +
-      "7. Seller delivers the item/service\n" +
-      "8. Buyer accepts; the escrower manually pays the seller\n" +
-      "9. Deal is marked completed\n\n" +
+      "2. Both parties agree to the posted deal in the escrow group\n" +
+      "3. The escrow admin accepts the deal\n" +
+      "4. You get the escrower's payment instructions\n" +
+      "5. Buyer (or the configured crypto payer) pays the escrower directly (UPI or crypto)\n" +
+      "6. The payer taps \"I've Paid\"\n" +
+      "7. The escrower personally verifies the payment\n" +
+      "8. Seller delivers the item/service\n" +
+      "9. Buyer accepts; the escrower manually pays the seller\n" +
+      "10. Deal is marked completed\n\n" +
       "If anything goes wrong, either party can open a dispute.\n\n" +
       "🔐 The bot never holds, sends or withdraws funds.",
       { reply_markup: backToMain }
@@ -281,6 +425,15 @@ bot.on("callback_query:data", async (ctx) => {
   }
   if (data === "deal:reject") {
     await ctx.editMessageText("Deal rejected.", { reply_markup: backToMain });
+    return;
+  }
+
+  // ── Deal: Party agrees to the posted deal card (group flow) ──
+  // The bot identifies who clicked and records the agreement for that party
+  // only — nobody can agree on someone else's behalf.
+  if (data.startsWith("deal:agree:")) {
+    const dealId = data.split(":")[2];
+    await handleAgreeToDeal(ctx, dealId);
     return;
   }
 
@@ -385,7 +538,10 @@ bot.on("callback_query:data", async (ctx) => {
     }
     const isParty = deal.buyerId === ctx.session.userId || deal.sellerId === ctx.session.userId;
     const isAdminUser = ctx.from ? config.adminTelegramIds.has(ctx.from.id) : false;
-    if (!isParty && !isAdminUser) {
+    const isGroupAdmin = ctx.from && deal.groupChatId
+      ? await groupService.isActiveGroupAdmin(deal.groupChatId, BigInt(ctx.from.id))
+      : false;
+    if (!isParty && !isAdminUser && !isGroupAdmin) {
       await ctx.answerCallbackQuery("Only the parties or an escrow admin can cancel.").catch(() => {});
       return;
     }
@@ -590,7 +746,8 @@ async function completePaymentReport(
         .text("\u{2705}  Verify Payment", `admin:verify_payment:${dealId}`)
         .text("\u{274C}  Reject Payment", `admin:reject_payment:${dealId}`)
         .row()
-        .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${dealId}`)
+        .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${dealId}`),
+      { dealId }
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
@@ -640,7 +797,8 @@ async function submitEvidence(ctx: MyContext, dealId: string, text: string, file
     await notificationService.notifyAdmins(
       `<b>EVIDENCE SUBMITTED</b>\n\nDeal: #${esc(dealId)}\nBy: @${esc(ctx.session.username ?? ctx.session.firstName)}\n` +
       (fileId ? "📎 Screenshot attached." : `Notes: ${esc(text)}`),
-      new InlineKeyboard().text("Review", `admin:verify_payment:${dealId}`)
+      new InlineKeyboard().text("Review", `admin:verify_payment:${dealId}`),
+      { dealId }
     );
   } catch (e: unknown) {
     await ctx.reply(esc(e instanceof Error ? e.message : "Could not submit evidence"), { reply_markup: backToMain });
@@ -675,6 +833,9 @@ async function adminPaymentSettings(ctx: MyContext) {
         .text("Set UPI Name", `admin:settings:set:${SETTING_KEYS.upiName}`)
         .row()
         .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
+        .row()
+        .text("\u{1F50D}  View Payment Methods", "admin:settings:view_methods")
+        .text("\u{1F5D1}\u{FE0F}  Remove USDT Address", "admin:settings:remove_usdt")
         .row()
         .text("\u{1F3E0}  Main Menu", "menu:main"),
     }

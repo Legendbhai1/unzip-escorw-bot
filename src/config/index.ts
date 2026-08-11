@@ -38,6 +38,17 @@ export const config = {
       .map(Number)
       .filter(Boolean)
   ),
+  // The bot owner is the only user who can /allowgroup, /disallowgroup,
+  // /addadmin, /removeadmin and /groupadmins. Explicitly configured via
+  // BOT_OWNER_TELEGRAM_ID; falls back to the first ADMIN_TELEGRAM_IDS entry
+  // so existing deployments keep working without a new env var.
+  botOwnerTelegramId:
+    Number(process.env.BOT_OWNER_TELEGRAM_ID ?? "") ||
+    Number(
+      (process.env.ADMIN_TELEGRAM_IDS ?? process.env.ADMIN_IDS ?? "")
+        .split(",")[0] ?? ""
+    ) ||
+    0,
 
   // Database
   databaseUrl: required("DATABASE_URL"),
@@ -106,4 +117,8 @@ export const config = {
 
 export function isAdmin(telegramId: number): boolean {
   return config.adminTelegramIds.has(telegramId);
+}
+
+export function isBotOwner(telegramId: number): boolean {
+  return config.botOwnerTelegramId > 0 && telegramId === config.botOwnerTelegramId;
 }

@@ -10,6 +10,7 @@ import { formatMoney, bpsToPercent } from "../lib/money.js";
 import { getPaymentInstructionsText, getAdminSetting, SETTING_KEYS } from "../lib/paymentInstructions.js";
 import { updateGroupDealCard } from "./scenes/dealForm.js";
 import { userService } from "../services/userService.js";
+import { groupService } from "../services/groupService.js";
 
 /**
  * Admin / Escrower panel.
@@ -170,14 +171,61 @@ async function listPendingPayments(ctx: MyContext) {
   }
 }
 
+/** Deal-scoped admin callbacks. These may be performed by global admins OR by
+ *  an ACTIVE escrow admin assigned to the deal's group (see
+ *  isAuthorizedForDealAction). All other admin:* callbacks stay global-admin
+ *  only. Every check is server-side — callback data is never trusted. */
+const DEAL_SCOPED_PREFIXES = [
+  "admin:accept_deal:",
+  "admin:mark_release_complete:",
+  "admin:mark_refund_complete:",
+  "admin:verify_payment:",
+  "admin:verify_confirm:",
+  "admin:reject_payment:",
+  "admin:request_evidence:",
+  "admin:confirm_release:",
+  "admin:mark_released:",
+  "admin:dispute:",
+  "admin:release:",
+  "admin:release_confirm:",
+  "admin:refund:",
+  "admin:refund_confirm:",
+  "admin:assign:",
+  "admin:ask_evidence:",
+];
+
+/** Global admin OR active group escrow admin of the deal's group. */
+async function isAuthorizedForDealAction(telegramId: number, dealId: string): Promise<boolean> {
+  if (config.adminTelegramIds.has(telegramId)) return true;
+  const deal = await prisma.deal.findUnique({
+    where: { id: dealId },
+    select: { groupChatId: true },
+  });
+  if (!deal?.groupChatId) return false;
+  return groupService.isActiveGroupAdmin(deal.groupChatId, BigInt(telegramId));
+}
+
 export async function handleAdminCallback(ctx: MyContext) {
-  // Server-side authorization gate — never trust callback data.
-  if (!ctx.from || !config.adminTelegramIds.has(ctx.from.id)) {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !data.startsWith("admin:")) return;
+  if (!ctx.from) {
     await ctx.answerCallbackQuery("Unauthorized.").catch(() => {});
     return;
   }
-  const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith("admin:")) return;
+
+  // Server-side authorization — never trust callback data.
+  const dealPrefix = DEAL_SCOPED_PREFIXES.find((p) => data.startsWith(p));
+  let authorized = false;
+  if (dealPrefix) {
+    const dealId = data.split(":")[2];
+    authorized = await isAuthorizedForDealAction(ctx.from.id, dealId);
+  } else {
+    authorized = config.adminTelegramIds.has(ctx.from.id);
+  }
+  if (!authorized) {
+    await ctx.answerCallbackQuery("Unauthorized.").catch(() => {});
+    return;
+  }
 
   // ── Payment settings (admin-entered escrow receiving details) ──
   if (data === "admin:settings") {
@@ -192,6 +240,35 @@ export async function handleAdminCallback(ctx: MyContext) {
       `Enter the new value for <b>${esc(settingLabel(key))}</b>.\n\n` +
       `Current: <code>${esc((await getAdminSetting(key)) || "— not set —")}</code>\n\n` +
       `Send <code>/cancel</code> to abort.`
+    );
+    return;
+  }
+
+  // ── View payment methods / Remove USDT address ──
+  if (data === "admin:settings:view_methods") {
+    const [upiId, upiName, usdt] = await Promise.all([
+      getAdminSetting(SETTING_KEYS.upiId),
+      getAdminSetting(SETTING_KEYS.upiName),
+      getAdminSetting(SETTING_KEYS.usdtBep20Address),
+    ]);
+    await ctx.editMessageText(
+      "<b>PAYMENT METHODS</b>\n\n" +
+      `💰 <b>INR / UPI</b>: ${upiId || upiName ? "✅ Configured" : "❌ Not configured"}\n` +
+      `🪙 <b>USDT BEP20</b>: ${usdt ? "✅ Configured" : "❌ Not configured"}\n\n` +
+      "Only these two methods are supported. The bot never generates or derives addresses — " +
+      "the escrower's own receiving details are entered manually.",
+      { reply_markup: new InlineKeyboard().text("Back", "admin:settings") }
+    );
+    return;
+  }
+
+  if (data === "admin:settings:remove_usdt") {
+    await prisma.adminSetting.deleteMany({ where: { key: SETTING_KEYS.usdtBep20Address } });
+    logger.info({ adminUserId: ctx.session.userId }, "Admin removed the USDT BEP20 escrow address");
+    await ctx.editMessageText(
+      "🗑 <b>USDT BEP20 address removed.</b>\n\n" +
+      "Users will see \"Payment method is currently unavailable\" until a new address is set.",
+      { reply_markup: new InlineKeyboard().text("Back", "admin:settings") }
     );
     return;
   }
@@ -704,6 +781,9 @@ async function showSettings(ctx: MyContext) {
         .row()
         .text("Set USDT BEP20 Address", `admin:settings:set:${SETTING_KEYS.usdtBep20Address}`)
         .row()
+        .text("\u{1F50D}  View Payment Methods", "admin:settings:view_methods")
+        .text("\u{1F5D1}\u{FE0F}  Remove USDT Address", "admin:settings:remove_usdt")
+        .row()
         .text("\u{1F3E0}  Main Menu", "menu:main"),
     }
   );
@@ -776,7 +856,10 @@ async function sendPaymentInstructionsToParties(ctx: MyContext, deal: any) {
   });
 }
 
-/** Escrow admin accepts a deal from the group card (admin-only, server-side). */
+/** Escrow admin accepts a deal from the group card. Server-side checks (never
+ *  trusts callback data): the deal exists, belongs to an APPROVED group, the
+ *  callback comes from that group, BOTH parties agreed, and the clicker is the
+ *  bot owner / a global admin / an ACTIVE escrow admin for THIS group. */
 async function acceptDealFromGroup(ctx: MyContext, dealId: string) {
   try {
     const deal = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
@@ -787,6 +870,23 @@ async function acceptDealFromGroup(ctx: MyContext, dealId: string) {
     if (deal.acceptedAt) {
       const accepter = deal.acceptedBy ? await userService.findById(deal.acceptedBy) : null;
       await ctx.answerCallbackQuery(`Already accepted by @${accepter?.username ?? "an admin"}.`);
+      return;
+    }
+    if (!deal.groupChatId || !(await groupService.isGroupApproved(deal.groupChatId))) {
+      await ctx.answerCallbackQuery("This group is not approved for escrow operations.").catch(() => {});
+      return;
+    }
+    const chatId = ctx.callbackQuery?.message?.chat?.id;
+    if (chatId && String(chatId) !== deal.groupChatId) {
+      await ctx.answerCallbackQuery("This deal belongs to another group.").catch(() => {});
+      return;
+    }
+    if (!deal.buyerAgreedAt || !deal.sellerAgreedAt) {
+      await ctx.answerCallbackQuery("Both parties must agree to the deal before it can be accepted.").catch(() => {});
+      return;
+    }
+    if (!ctx.from || !(await groupService.isAuthorizedForGroup(ctx.from.id, deal.groupChatId))) {
+      await ctx.answerCallbackQuery("Unauthorized — you are not an escrow admin for this group.").catch(() => {});
       return;
     }
 

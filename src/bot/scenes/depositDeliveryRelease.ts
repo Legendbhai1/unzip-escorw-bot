@@ -235,7 +235,8 @@ export async function handleReleaseAgree(ctx: Ctx, dealId: string, agree: boolea
       new InlineKeyboard()
         .text("\u{2705}  Mark Release Completed", `admin:mark_release_complete:${dealId}`)
         .row()
-        .text("\u{1F6A8}  Open Dispute", `admin:dispute:${dealId}`)
+        .text("\u{1F6A8}  Open Dispute", `admin:dispute:${dealId}`),
+      { dealId }
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
@@ -275,7 +276,8 @@ export async function handleRefundAgree(ctx: Ctx, dealId: string, agree: boolean
       new InlineKeyboard()
         .text("\u{2705}  Mark Refund Completed", `admin:mark_refund_complete:${dealId}`)
         .row()
-        .text("\u{1F6A8}  Open Dispute", `admin:dispute:${dealId}`)
+        .text("\u{1F6A8}  Open Dispute", `admin:dispute:${dealId}`),
+      { dealId }
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";

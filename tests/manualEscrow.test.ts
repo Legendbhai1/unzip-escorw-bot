@@ -61,6 +61,12 @@ async function toAwaitingPayment(dealId: string) {
   await dealService.join(dealId, SELLER_ID);
 }
 
+/** Both parties agree to the posted deal card (required before admin accept). */
+async function agreeBoth(dealId: string) {
+  await dealService.agreeToDeal(dealId, BUYER_ID);
+  await dealService.agreeToDeal(dealId, SELLER_ID);
+}
+
 beforeAll(async () => {
   await cleanAll();
   await createUser(BUYER_ID, "buyer_user", "440000000000000001");
@@ -447,10 +453,14 @@ describe("Fee calculation (INR example from spec)", () => {
 // ═══════════════════════════════════════════════════════════════════
 
 describe("Admin acceptance (group deal card)", () => {
-  it("CREATED -> AWAITING_PAYMENT via adminAccept, records acceptedBy/At, rejects duplicates", async () => {
+  it("CREATED -> AWAITING_PAYMENT via adminAccept (after both parties agree), records acceptedBy/At, rejects duplicates", async () => {
     const deal = await createDeal("INR", "10000");
     expect(deal.status).toBe("CREATED");
 
+    // Admin cannot accept before both parties agreed to the posted card.
+    await expect(dealService.adminAccept(deal.id, ADMIN_ID)).rejects.toThrow(/both parties must agree/i);
+
+    await agreeBoth(deal.id);
     await dealService.adminAccept(deal.id, ADMIN_ID);
     const accepted = await prisma.deal.findUnique({ where: { id: deal.id } });
     expect(accepted?.status).toBe("AWAITING_PAYMENT");
@@ -499,6 +509,7 @@ describe("Crypto payer (USDT BEP20)", () => {
       category: "FREELANCE_SERVICES",
     });
 
+    await agreeBoth(deal.id);
     await dealService.adminAccept(deal.id, ADMIN_ID);
 
     // The buyer cannot report payment on a seller-pays deal.
@@ -530,6 +541,7 @@ describe("Crypto payer (USDT BEP20)", () => {
 describe("Partial release & refund", () => {
   async function fundedDeal(amount = "100") {
     const deal = await createDeal("CRYPTO", amount);
+    await agreeBoth(deal.id);
     await dealService.adminAccept(deal.id, ADMIN_ID);
     await dealService.reportPayment(deal.id, BUYER_ID, {});
     await dealService.verifyPayment(deal.id, ADMIN_ID);

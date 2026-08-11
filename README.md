@@ -13,16 +13,33 @@ and personally pays the seller / refunds the buyer outside the bot.
   `form` (all share one canonical flow). Choose payment method (**INR / UPI**
   or **USDT BEP20**), your role, the counterparty's Telegram username (they
   must have started the bot), amount, (for USDT: **who pays** — Buyer or
-  Seller), category and description, then preview and confirm.
-- **Group deal card**: the finished deal is posted to the configured escrow
+  Seller), category, description, **deal duration**, **release condition** and
+  **refund condition**, then preview and confirm. The duration is a
+  term/deadline only — the bot never auto-refunds or auto-releases when it
+  passes.
+- **Group deal card**: the finished deal is posted to an **approved** escrow
   group. **The Telegram message itself is the deal reference** — there are no
-  web links. The card shows `Status: WAITING FOR ADMIN` with
-  `[Accept Deal]` / `[Cancel Deal]` buttons.
-- **Admin acceptance**: only an authorized admin can press `Accept Deal`
-  (checked server-side). The deal moves to `AWAITING_PAYMENT`, `acceptedBy` /
-  `acceptedAt` are recorded, the group card is updated, and both parties
-  receive the escrower's payment instructions in DM. Duplicate acceptance is
-  rejected and shows who already accepted.
+  web links. The card shows the full terms and a `🤝 Agreement` section with
+  `[✅ Agree to Deal]`. The bot identifies WHO clicked and records the
+  agreement for that party only — nobody can agree on someone else's behalf.
+- **Party agreement**: once **both** parties have agreed to the posted terms,
+  the card shows `Status: WAITING FOR ADMIN` with `[🛡 Accept Deal]`, and the
+  owner + that group's escrow admins are notified in DM.
+- **Group authorization**: only the bot owner can authorize a group
+  (`/allowgroup` inside the group, persisted in the DB). `/disallowgroup`
+  disables new escrow activity in the group **without deleting** deals, users
+  or audit records. Deal creation is refused until the escrow group is
+  approved.
+- **Group-specific escrow admins**: the owner assigns admins per group with
+  `/addadmin @user` (inside that group). Being a normal Telegram group admin
+  gives **no** escrow powers — every sensitive action is re-checked
+  server-side against the active assignment for **that specific group**.
+- **Admin acceptance**: only the bot owner, a global admin, or an ACTIVE
+  escrow admin for the deal's group can press `Accept Deal` (checked
+  server-side, and only after both parties agreed). The deal moves to
+  `AWAITING_PAYMENT`, `acceptedBy` / `acceptedAt` are recorded, the group card
+  is updated, and both parties receive the escrower's payment instructions in
+  DM. Duplicate acceptance is rejected and shows who already accepted.
 - **Manual payment**: the payer (buyer, or the configured crypto payer for
   USDT deals) pays the escrower directly using the **admin-entered** payment
   details, then taps **Payment Sent / Check Payment** — this only creates a
@@ -67,8 +84,9 @@ and personally pays the seller / refunds the buyer outside the bot.
 |---|---|---|
 | `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `DATABASE_URL` | ✅ | PostgreSQL URL (Prisma migrations auto-apply on deploy) |
-| `ADMIN_TELEGRAM_IDS` | ✅ | Comma-separated admin/escrower Telegram IDs (only they can accept deals, verify payment, complete releases/refunds, resolve disputes, edit payment settings) |
-| `ESCROW_GROUP_ID` | ⚠️ | Chat id of the escrow group where deal cards are posted (required for the group flow) |
+| `ADMIN_TELEGRAM_IDS` | ✅ | Comma-separated admin/escrower Telegram IDs (they can accept deals, verify payment, complete releases/refunds, resolve disputes, edit payment settings, in every group) |
+| `ESCROW_GROUP_ID` | ⚠️ | Chat id of the escrow group where deal cards are posted (must also be authorized by the owner with `/allowgroup`; if unset the first approved group is used) |
+| `BOT_OWNER_TELEGRAM_ID` | ⚠️ | The single bot owner who can run `/allowgroup`, `/disallowgroup`, `/addadmin`, `/removeadmin`, `/groupadmins`. Falls back to the first `ADMIN_TELEGRAM_IDS` entry when unset |
 
 ## Payment settings (admin-entered, never generated)
 
@@ -90,13 +108,17 @@ used as a **fallback**:
 ## Flow
 
 ```
+OWNER: /allowgroup in the group, then /addadmin @user for its escrow admins
 CREATE DEAL (button / /form / "form")
   → PAYMENT METHOD (INR / UPI | USDT BEP20)
-  → ROLE → COUNTERPARTY → AMOUNT → (USDT: CRYPTO PAYER) → CATEGORY → TERMS → CONFIRM
-  → deal card posted to escrow group (Status: WAITING FOR ADMIN)
-  → ADMIN ACCEPTS (group card) → AWAITING_PAYMENT (acceptedBy/acceptedAt recorded)
+  → ROLE → COUNTERPARTY → AMOUNT → (USDT: CRYPTO PAYER) → CATEGORY
+  → DESCRIPTION → DEAL DURATION → RELEASE CONDITION → REFUND CONDITION → CONFIRM
+  → deal card posted to the APPROVED escrow group (Status: WAITING FOR PARTY AGREEMENT)
+  → BUYER [✅ Agree to Deal] → SELLER [✅ Agree to Deal] (bot records who clicked)
+  → BOTH AGREED → Status: WAITING FOR ADMIN → owner + group admins notified
+  → GROUP ESCROW ADMIN [🛡 Accept Deal] → AWAITING_PAYMENT (acceptedBy/acceptedAt recorded)
   → PAYMENT INSTRUCTIONS sent to both parties in DM
-  → PAYER PAYS ESCROWER MANUALLY (UPI or USDT BEP20)
+  → PAYER PAYS ESCROWER MANUALLY (INR: buyer pays UPI · USDT: the configured crypto payer)
   → PAYER REPORTS (Payment Sent) → PAYMENT_REPORTED
   → ADMIN MANUALLY VERIFIES → FUNDED → both notified in DM
   → SELLER DELIVERS → DELIVERED
@@ -112,10 +134,18 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
 ## Commands
 
 - `/start` — main menu
-- `/form` or typing `form` — create a deal (works in DM and in the escrow
-  group, subject to Telegram permissions)
-- `/admin` — admin dashboard (admins only)
-- `/settings` — view/edit escrow payment details (admins only)
+- `/form` or typing `form` — create a deal (runs in a private chat so the
+  multi-step form stays isolated; the finished deal is posted to the escrow
+  group automatically)
+- `/allowgroup` — authorize the current group for escrow (bot owner only)
+- `/disallowgroup` — disable escrow in the current group, keeping all data
+  (bot owner only)
+- `/addadmin @user` — assign a group-specific escrow admin for the current
+  group (bot owner only)
+- `/removeadmin @user` — remove a group-specific escrow admin (bot owner only)
+- `/groupadmins` — list the current group's escrow admins (bot owner only)
+- `/admin` — admin dashboard (global admins only)
+- `/settings` — view/edit escrow payment details (global admins only)
 - `/disputes`, `/review`, `/ban`, `/suspend`, `/user` — admin tooling
 - `/release all` | `/release 50` — request a (partial) release; reply to the
   deal message in the group, or use your last viewed deal in DM (optionally
@@ -124,8 +154,11 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
 
 ## Telegram group setup (permissions)
 
-For the group flow to work, the escrow group should be configured via
-`ESCROW_GROUP_ID` and the bot added to it. Recommended permissions:
+For the group flow to work, the escrow group must be configured via
+`ESCROW_GROUP_ID` (or be the first group approved with `/allowgroup`), the bot
+added to it, and the group **authorized** by the bot owner with `/allowgroup`
+inside the group. Escrow admins are then assigned per group with
+`/addadmin @user`. Recommended permissions:
 
 - **Add the bot as a group administrator** (or disable Privacy Mode) so the
   bot reliably receives messages/callbacks in the group. Inline-button
@@ -134,9 +167,12 @@ For the group flow to work, the escrow group should be configured via
 - The bot posts the deal card itself, so it needs permission to **send
   messages** (and ideally to **edit messages**, which it has for its own
   messages).
-- Only admins from `ADMIN_TELEGRAM_IDS` can accept/cancel deals — the bot
-  re-checks authorization server-side on every callback; a crafted callback
-  from a non-admin is rejected.
+- Only the bot owner, global admins (`ADMIN_TELEGRAM_IDS`) or an ACTIVE
+  group escrow admin (`/addadmin`) for that group can accept/verify deals —
+  the bot re-checks authorization server-side on every callback; a crafted
+  callback from a non-admin is rejected. Deal cards are only posted to groups
+  approved with `/allowgroup`; a normal Telegram group admin gets no escrow
+  powers.
 
 ## Build / test
 

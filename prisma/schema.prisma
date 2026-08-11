@@ -81,6 +81,17 @@ enum EscrowAuditAction {
   FEE_RECORDED
   DISPUTE_OPENED
   DISPUTE_RESOLVED
+  DEAL_AGREED
+}
+
+enum GroupStatus {
+  APPROVED
+  DISALLOWED
+}
+
+enum GroupAdminStatus {
+  ACTIVE
+  REMOVED
 }
 
 enum TransactionType {
@@ -179,6 +190,10 @@ model User {
   verifiedPayments    PaymentReport[] @relation("PaymentVerifier")
   escrowAuditLogs     EscrowAuditLog[]
   adminSettings       AdminSetting[]
+  groupsAllowedBy     GroupAuthorization[] @relation("GroupAllowedBy")
+  groupsDisallowedBy  GroupAuthorization[] @relation("GroupDisallowedBy")
+  groupAdmins         GroupAdmin[]         @relation("GroupAdminAssigner")
+  groupAdminOf        GroupAdmin[]
 
   @@map("users")
 }
@@ -227,6 +242,17 @@ model Deal {
   // The group message where the deal card lives (the message is the deal reference).
   groupChatId          String?       @map("group_chat_id") @db.VarChar(64)
   groupMessageId       Int?          @map("group_message_id")
+  // ── Party agreement to the posted deal terms (group flow) ──
+  // A deal can only be accepted by an escrow admin after BOTH parties have
+  // agreed to the posted card. The bot identifies who clicked and records the
+  // agreement for that party only — nobody can agree on someone else's behalf.
+  buyerAgreedAt        DateTime?     @map("buyer_agreed_at") @db.Timestamptz()
+  sellerAgreedAt       DateTime?     @map("seller_agreed_at") @db.Timestamptz()
+  // ── Deal terms (asked during creation, immutable once posted) ──
+  dealDuration         String?       @map("deal_duration") @db.VarChar(64)
+  dealDeadlineAt       DateTime?     @map("deal_deadline_at") @db.Timestamptz() // informational deadline — never auto-refunds/releases
+  releaseCondition     String?       @map("release_condition") @db.Text
+  refundCondition      String?       @map("refund_condition") @db.Text
   paymentReportedAt    DateTime?     @map("payment_reported_at") @db.Timestamptz()
   paymentReportedBy    String?       @map("payment_reported_by") @db.Uuid
   paymentVerifiedAt    DateTime?     @map("payment_verified_at") @db.Timestamptz()
@@ -505,6 +531,53 @@ model AdminSetting {
   admin User? @relation(fields: [updatedBy], references: [id])
 
   @@map("admin_settings")
+}
+
+// ─── Group Authorization (bot-owner approved escrow groups) ─────────────
+// Only the bot owner can approve/disallow a group with /allowgroup and
+// /disallowgroup. The row is persisted so authorization does not rely on env
+// vars alone. Disallowing a group NEVER deletes deals, users or audit data.
+
+model GroupAuthorization {
+  groupId       String        @id @map("group_id") @db.VarChar(64)
+  groupTitle    String?       @map("group_title") @db.VarChar(256)
+  status        GroupStatus   @default(APPROVED)
+  allowedBy     String?       @map("allowed_by") @db.Uuid
+  allowedAt     DateTime      @default(now()) @map("allowed_at") @db.Timestamptz()
+  disallowedBy  String?       @map("disallowed_by") @db.Uuid
+  disallowedAt  DateTime?     @map("disallowed_at") @db.Timestamptz()
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz()
+
+  allowedByUser     User?       @relation("GroupAllowedBy", fields: [allowedBy], references: [id], onDelete: SetNull)
+  disallowedByUser  User?       @relation("GroupDisallowedBy", fields: [disallowedBy], references: [id], onDelete: SetNull)
+  admins            GroupAdmin[]
+
+  @@map("group_authorizations")
+}
+
+// ─── Group Escrow Admins (assigned per group by the bot owner) ──────────
+// The bot owner assigns escrow admins separately for each approved group with
+// /addadmin. Being a normal Telegram group admin gives NO escrow powers —
+// every sensitive action is checked server-side against these rows plus the
+// bot owner / global admins.
+
+model GroupAdmin {
+  id         String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  groupId    String            @map("group_id") @db.VarChar(64)
+  userId     String            @map("user_id") @db.Uuid
+  assignedBy String            @map("assigned_by") @db.Uuid
+  assignedAt DateTime          @default(now()) @map("assigned_at") @db.Timestamptz()
+  status     GroupAdminStatus  @default(ACTIVE)
+  removedAt  DateTime?         @map("removed_at") @db.Timestamptz()
+
+  group    GroupAuthorization @relation(fields: [groupId], references: [groupId], onDelete: Cascade)
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assigner User               @relation("GroupAdminAssigner", fields: [assignedBy], references: [id])
+
+  @@unique([groupId, userId])
+  @@index([groupId, status])
+  @@map("group_admins")
 }
 
 // ─── Disputes ─────────────────────────────────────────────────────────────

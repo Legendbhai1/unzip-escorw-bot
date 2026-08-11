@@ -2,12 +2,14 @@ import { InlineKeyboard } from "grammy";
 import { DealCategory } from "@prisma/client";
 import { config } from "../../config/index.js";
 import { userService } from "../../services/userService.js";
+import { groupService } from "../../services/groupService.js";
 import { dealService } from "../../services/dealService.js";
 import { notificationService } from "../../services/notificationService.js";
 import { prisma } from "../../lib/db.js";
 import { logger } from "../../lib/logger.js";
 import { esc } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
+import { parseDurationDeadline } from "../../lib/dealTerms.js";
 import {
   paymentMethodSelect, roleSelect, cryptoPayerSelect, categorySelect,
   formConfirm, activeFormOptions, backToMain,
@@ -32,7 +34,8 @@ import type { MyContext } from "../context.js";
 
 export type DealFormStep =
   | "payment_method" | "role" | "counterparty" | "amount"
-  | "crypto_payer" | "category" | "description" | "preview";
+  | "crypto_payer" | "category" | "description" | "deal_duration"
+  | "release_condition" | "refund_condition" | "preview";
 
 function clearForm(ctx: MyContext) {
   const s = ctx.session;
@@ -47,6 +50,9 @@ function clearForm(ctx: MyContext) {
   s.createDealCryptoPayer = undefined;
   s.createDealDescription = undefined;
   s.createDealCategory = undefined;
+  s.createDealDuration = undefined;
+  s.createDealReleaseCondition = undefined;
+  s.createDealRefundCondition = undefined;
 }
 
 export function paymentLabel(method?: string): string {
@@ -73,6 +79,12 @@ export function renderCurrentStep(ctx: MyContext): string | null {
       return "<b>CATEGORY</b>\n\nSelect the trade category:";
     case "description":
       return "<b>DEAL DESCRIPTION</b>\n\nDescribe what is being traded:\n\n<i>Example: Logo design for website, 3 revisions included</i>";
+    case "deal_duration":
+      return "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.";
+    case "release_condition":
+      return "<b>RELEASE CONDITION</b>\n\nWhen should the escrowed payment be <b>released to the seller</b>?\n\n<i>Example: After the buyer receives and approves the work</i>";
+    case "refund_condition":
+      return "<b>REFUND CONDITION</b>\n\nUnder what circumstances should the <b>buyer receive a refund</b>?\n\n<i>Example: If the seller does not deliver within the agreed duration</i>";
     default:
       return null;
   }
@@ -176,9 +188,9 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
   // ── Category ──
   if (data.startsWith("form:cat:")) {
     s.createDealCategory = data.replace("form:cat:", "");
-    s.createDealStep = "description";
+    s.createDealStep = "deal_duration";
     await ctx.editMessageText(
-      "<b>DEAL DESCRIPTION</b>\n\nDescribe what is being traded:\n\n<i>Example: Logo design for website, 3 revisions included</i>",
+      "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
       { reply_markup: backToMain }
     );
     return true;
@@ -288,6 +300,51 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
       return true; // stay on the step
     }
     s.createDealDescription = text;
+    s.createDealStep = "deal_duration";
+    await ctx.reply(
+      "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
+      { reply_markup: backToMain }
+    );
+    return true;
+  }
+
+  // ── Deal duration (informational term, never auto-enforced) ──
+  if (step === "deal_duration") {
+    if (text.length < 1 || text.length > 64) {
+      await ctx.reply("Duration must be between 1 and 64 characters, e.g. <code>7 days</code>.", { reply_markup: backToMain });
+      return true; // stay on the step
+    }
+    s.createDealDuration = text.trim();
+    s.createDealStep = "release_condition";
+    await ctx.reply(
+      "<b>RELEASE CONDITION</b>\n\nWhen should the escrowed payment be <b>released to the seller</b>?\n\n<i>Example: After the buyer receives and approves the work</i>",
+      { reply_markup: backToMain }
+    );
+    return true;
+  }
+
+  // ── Release condition ──
+  if (step === "release_condition") {
+    if (text.length < 5 || text.length > 400) {
+      await ctx.reply("Release condition must be between 5 and 400 characters.", { reply_markup: backToMain });
+      return true; // stay on the step
+    }
+    s.createDealReleaseCondition = text;
+    s.createDealStep = "refund_condition";
+    await ctx.reply(
+      "<b>REFUND CONDITION</b>\n\nUnder what circumstances should the <b>buyer receive a refund</b>?\n\n<i>Example: If the seller does not deliver within the agreed duration</i>",
+      { reply_markup: backToMain }
+    );
+    return true;
+  }
+
+  // ── Refund condition → preview ──
+  if (step === "refund_condition") {
+    if (text.length < 5 || text.length > 400) {
+      await ctx.reply("Refund condition must be between 5 and 400 characters.", { reply_markup: backToMain });
+      return true; // stay on the step
+    }
+    s.createDealRefundCondition = text;
     s.createDealStep = "preview";
     await previewDealForm(ctx);
     return true;
@@ -321,6 +378,14 @@ export async function previewDealForm(ctx: MyContext) {
     ? `Crypto payer: <b>${s.createDealCryptoPayer === "SELLER" ? "Seller" : "Buyer"}</b>\n`
     : "";
 
+  const durationLine = s.createDealDuration ? `⏱ Deal duration: <b>${esc(s.createDealDuration)}</b>\n` : "";
+  const releaseLine = s.createDealReleaseCondition
+    ? `🔓 Release condition:\n${esc(s.createDealReleaseCondition)}\n`
+    : "";
+  const refundLine = s.createDealRefundCondition
+    ? `↩️ Refund condition:\n${esc(s.createDealRefundCondition)}\n`
+    : "";
+
   await ctx.reply(
     `<b>CREATE ESCROW</b>\n\n` +
     `Payment: <b>${paymentLabel(s.createDealPaymentMethod)}</b>\n` +
@@ -333,7 +398,10 @@ export async function previewDealForm(ctx: MyContext) {
     `Seller fee (${bpsToPercent(config.sellerFeeBps)}): ${sellerFeeStr}\n\n` +
     `Buyer total: <b>${buyerTotalStr}</b>\n` +
     `Seller receives: <b>${sellerReceivesStr}</b>\n\n` +
-    `Terms:\n${esc(s.createDealDescription ?? "")}\n\n` +
+    `📝 Description:\n${esc(s.createDealDescription ?? "")}\n\n` +
+    durationLine +
+    releaseLine +
+    refundLine +
     `🔐 Payment is manually verified by the escrower.`,
     { reply_markup: formConfirm() }
   );
@@ -360,6 +428,39 @@ function groupStatusLabel(status: string): string {
   return map[status] ?? status.replace(/_/g, " ");
 }
 
+/** Status label for the group card: during the agreement phase it shows how
+ *  many parties have agreed; once both have agreed it becomes WAITING FOR
+ *  ADMIN so the escrow admin knows the deal is ready to accept. */
+export function dealCardStatusLabel(deal: any): string {
+  if ((deal.status ?? "CREATED") === "CREATED") {
+    const buyerOk = Boolean(deal.buyerAgreedAt);
+    const sellerOk = Boolean(deal.sellerAgreedAt);
+    if (buyerOk && sellerOk) return "WAITING FOR ADMIN";
+    return `WAITING FOR PARTY AGREEMENT (${[buyerOk, sellerOk].filter(Boolean).length}/2)`;
+  }
+  return groupStatusLabel(deal.status);
+}
+
+/** Keyboard for the group deal card. While the deal is pending (CREATED):
+ *  [✅ Agree to Deal] until both parties agree (the bot identifies who
+ *  clicks), then [🛡 Accept Deal] for the escrow admin. Once the deal has
+ *  moved past creation the card becomes read-only with a View Status button. */
+export function groupCardKeyboard(deal: any): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if ((deal.status ?? "CREATED") === "CREATED") {
+    const bothAgreed = Boolean(deal.buyerAgreedAt) && Boolean(deal.sellerAgreedAt);
+    if (bothAgreed) {
+      kb.text("\u{1F6E1}\u{FE0F}  Accept Deal", `admin:accept_deal:${deal.id}`);
+    } else {
+      kb.text("\u{2705}  Agree to Deal", `deal:agree:${deal.id}`);
+    }
+    kb.row().text("\u{274C}  Cancel Deal", `deal:cancel:${deal.id}`);
+  } else {
+    kb.text("\u{1F4CB}  View Status", `deal:status:${deal.id}`);
+  }
+  return kb;
+}
+
 /** Build the group-post deal card. The Telegram message itself is the deal
  *  reference — there are NO web links. */
 export function buildDealCard(
@@ -376,27 +477,79 @@ export function buildDealCard(
   const cryptoPayerLine = isUsdt
     ? `Crypto payer: <b>${(deal.cryptoPayer ?? "BUYER") === "SELLER" ? "Seller" : "Buyer"}</b>\n`
     : "";
+  const durationLine = deal.dealDuration
+    ? `⏱ Deal duration: <b>${esc(deal.dealDuration)}</b>\n`
+    : "";
+  const releaseLine = deal.releaseCondition
+    ? `🔓 Release condition:\n${esc(deal.releaseCondition)}\n`
+    : "";
+  const refundLine = deal.refundCondition
+    ? `↩️ Refund condition:\n${esc(deal.refundCondition)}\n`
+    : "";
+
+  // Party agreement block — the bot records who actually clicked.
+  const agreementBlock =
+    `🤝 <b>AGREEMENT</b>\n` +
+    `Buyer: ${buyerUsername ? `@${esc(buyerUsername)}` : "—"} ${deal.buyerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n` +
+    `Seller: ${sellerUsername ? `@${esc(sellerUsername)}` : "—"} ${deal.sellerAgreedAt ? "✅ Agreed" : "⏳ Waiting"}\n`;
 
   return (
     `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
+    `━━━━━━━━━━━━━━━━\n` +
     `👤 Buyer: @${esc(buyerUsername ?? "N/A")}\n` +
     `👤 Seller: @${esc(sellerUsername ?? "N/A")}\n\n` +
     `💳 Payment: <b>${esc(deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20")}</b>\n` +
     cryptoPayerLine +
     `💰 Amount: <b>${amountStr}</b>\n` +
-    `📦 Category: ${esc(deal.category?.replace(/_/g, " ") ?? "")}\n` +
-    `📝 Terms:\n${esc(deal.description)}\n\n` +
-    `💸 Buyer fee: ${buyerFeeStr} · Seller fee: ${sellerFeeStr}\n\n` +
-    `Status: <b>${esc(status ?? groupStatusLabel(deal.status ?? "CREATED"))}</b>\n\n` +
+    `📦 Category: ${esc(deal.category?.replace(/_/g, " ") ?? "")}\n\n` +
+    `📝 Description:\n${esc(deal.description)}\n\n` +
+    durationLine +
+    releaseLine +
+    refundLine +
+    `💸 Buyer fee: ${buyerFeeStr} · Seller fee: ${sellerFeeStr}\n` +
+    `━━━━━━━━━━━━━━━━\n\n` +
+    agreementBlock +
+    `\nStatus: <b>${esc(status ?? dealCardStatusLabel(deal))}</b>\n\n` +
     `🔐 Payment is manually verified by the escrower.`
   );
 }
 
-/** Create the deal from the completed form, post the card to the escrow
- *  group (the deal reference) and notify the counterparty. */
+/** Resolve the escrow group a new deal card is posted to: the configured
+ *  ESCROW_GROUP_ID when set, otherwise the first approved group. */
+export async function resolveEscrowGroupId(): Promise<string> {
+  const configured = config.escrowGroupId.trim();
+  if (configured) return configured;
+  const approved = await groupService.getFirstApprovedGroupId();
+  return approved ?? "";
+}
+
+/** Create the deal from the completed form, post the card to an APPROVED
+ *  escrow group (the deal reference) and notify the counterparty. */
 export async function createDealFromForm(ctx: MyContext) {
   const s = ctx.session;
   try {
+    // Only an approved escrow group can host deals — do NOT create the deal
+    // if no group is configured/approved (the creator gets a clear message).
+    const targetGroupId = await resolveEscrowGroupId();
+    if (!targetGroupId) {
+      await ctx.reply(
+        "⚠️ <b>ESCROW GROUP NOT AUTHORIZED</b>\n\n" +
+        "No escrow group is configured or approved yet.\n\n" +
+        "The bot owner must add the bot to the escrow group and run <code>/allowgroup</code> there before deals can be created."
+      );
+      clearForm(ctx);
+      return;
+    }
+    if (!(await groupService.isGroupApproved(targetGroupId))) {
+      await ctx.reply(
+        "⚠️ <b>GROUP NOT AUTHORIZED</b>\n\n" +
+        "This group is not approved for escrow operations.\n\n" +
+        "The bot owner must run <code>/allowgroup</code> inside the group before deals can be posted there."
+      );
+      clearForm(ctx);
+      return;
+    }
+
     const buyerId = s.createDealRole === "buyer" ? s.userId : (s.createDealCounterpartyUserId ?? "");
     const sellerId = s.createDealRole === "seller" ? s.userId : (s.createDealCounterpartyUserId ?? null);
     const paymentMethod = s.createDealPaymentMethod ?? "CRYPTO";
@@ -415,6 +568,10 @@ export async function createDealFromForm(ctx: MyContext) {
       cryptoPayer: paymentMethod === "CRYPTO" ? (s.createDealCryptoPayer ?? "BUYER") : undefined,
       description: s.createDealDescription ?? "",
       category: (s.createDealCategory ?? "FREELANCE_SERVICES") as DealCategory,
+      dealDuration: s.createDealDuration ?? undefined,
+      dealDeadlineAt: s.createDealDuration ? parseDurationDeadline(s.createDealDuration) ?? undefined : undefined,
+      releaseCondition: s.createDealReleaseCondition ?? undefined,
+      refundCondition: s.createDealRefundCondition ?? undefined,
     });
 
     // Notify counterparty (no web link — the group card is the deal reference).
@@ -435,7 +592,7 @@ export async function createDealFromForm(ctx: MyContext) {
     // intended seller's username for the card instead of showing "N/A".
     const intendedSellerUsername =
       s.createDealRole === "seller" ? (s.username ?? null) : (s.createDealCounterpartyUsername ?? null);
-    await postDealCardToGroup(ctx, deal, intendedSellerUsername);
+    await postDealCardToGroup(ctx, deal, intendedSellerUsername, targetGroupId);
 
     await ctx.reply(
       `<b>DEAL CREATED</b>\n\n` +
@@ -460,14 +617,24 @@ export async function createDealFromForm(ctx: MyContext) {
   clearForm(ctx);
 }
 
-/** Post the completed deal card to the configured escrow group and remember
- *  the message (chat id + message id) on the deal so it can be updated as the
- *  deal progresses. The Telegram message itself is the deal reference — the
- *  bot never generates web links. */
-export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSellerUsername?: string | null) {
-  const groupId = config.escrowGroupId.trim();
-  if (!groupId) {
-    logger.info({ dealId: deal.id }, "ESCROW_GROUP_ID not configured — deal card not posted to a group");
+/** Post the completed deal card to an APPROVED escrow group and remember the
+ *  message (chat id + message id) on the deal so it can be updated as the deal
+ *  progresses. The Telegram message itself is the deal reference — the bot
+ *  never generates web links. Refuses to post to a group that has not been
+ *  approved via /allowgroup. */
+export async function postDealCardToGroup(
+  ctx: MyContext,
+  deal: any,
+  intendedSellerUsername?: string | null,
+  groupId?: string
+) {
+  const target = groupId?.trim() || (await resolveEscrowGroupId());
+  if (!target) {
+    logger.info({ dealId: deal.id }, "No escrow group configured/approved — deal card not posted to a group");
+    return;
+  }
+  if (!(await groupService.isGroupApproved(target))) {
+    logger.warn({ dealId: deal.id, groupId: target }, "Refusing to post deal card: group not approved for escrow");
     return;
   }
 
@@ -477,14 +644,12 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSel
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
   const sellerName = seller?.username ?? intendedSellerUsername ?? null;
 
-  const kb = new InlineKeyboard()
-    .text("✅  Accept Deal", `admin:accept_deal:${deal.id}`)
-    .text("❌  Cancel Deal", `deal:cancel:${deal.id}`);
+  const kb = groupCardKeyboard(deal);
 
   try {
     const sent = await ctx.api.sendMessage(
-      groupId,
-      buildDealCard(deal, buyer?.username ?? null, sellerName, "WAITING FOR ADMIN"),
+      target,
+      buildDealCard(deal, buyer?.username ?? null, sellerName, dealCardStatusLabel(deal)),
       { parse_mode: "HTML", reply_markup: kb }
     );
     await prisma.deal.update({
@@ -494,9 +659,9 @@ export async function postDealCardToGroup(ctx: MyContext, deal: any, intendedSel
         groupMessageId: sent.message_id,
       },
     });
-    logger.info({ dealId: deal.id, groupId, messageId: sent.message_id }, "Deal card posted to escrow group");
+    logger.info({ dealId: deal.id, groupId: target, messageId: sent.message_id }, "Deal card posted to escrow group");
   } catch (e) {
-    logger.warn({ dealId: deal.id, groupId, err: e }, "Failed to post deal card to escrow group");
+    logger.warn({ dealId: deal.id, groupId: target, err: e }, "Failed to post deal card to escrow group");
   }
 }
 
@@ -506,14 +671,13 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
   if (!deal?.groupChatId || !deal?.groupMessageId) return;
   const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
   const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
-  const status = groupStatusLabel(deal.status);
+  const status = dealCardStatusLabel(deal);
 
   const acceptedByLine = deal.acceptedAt && deal.acceptedBy
     ? `\nAccepted by: @${esc(deal.acceptedByUsername ?? "escrow admin")}`
     : "";
 
-  const kb = new InlineKeyboard()
-    .text("📋  View Status", `deal:status:${deal.id}`);
+  const kb = groupCardKeyboard(deal);
 
   try {
     await ctx.api.editMessageText(
@@ -524,5 +688,73 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
     );
   } catch (e) {
     logger.warn({ dealId: deal.id, err: e }, "Failed to update group deal card");
+  }
+}
+
+/**
+ * Party clicks [✅ Agree to Deal] on the group card. The bot identifies the
+ * Telegram user who clicked and records the agreement for THEIR party only.
+ * After both parties agree, the card is re-rendered with [🛡 Accept Deal] and
+ * the owner + this group's escrow admins are notified.
+ */
+export async function handleAgreeToDeal(ctx: MyContext, dealId: string) {
+  try {
+    const deal = await dealService.findWithParties(dealId);
+    if (!deal) {
+      await ctx.answerCallbackQuery("Deal not found.").catch(() => {});
+      return;
+    }
+
+    // The callback must come from the deal's own group (when known).
+    const chatId = ctx.callbackQuery?.message?.chat?.id;
+    if (deal.groupChatId && chatId && String(chatId) !== deal.groupChatId) {
+      await ctx.answerCallbackQuery("This deal belongs to another group.").catch(() => {});
+      return;
+    }
+
+    const res = await dealService.agreeToDeal(dealId, ctx.session.userId);
+    await ctx.answerCallbackQuery(
+      res.agreedBy === "BUYER" ? "Buyer agreed \u2705" : "Seller agreed \u2705"
+    ).catch(() => {});
+
+    await ctx.reply(
+      `<b>AGREEMENT RECORDED</b>\n\n` +
+      `You agreed to the terms of deal #${esc(deal.inviteCode)}.\n\n` +
+      (res.bothAgreed
+        ? "🤝 <b>Both parties have agreed.</b>\n\nWaiting for the escrow admin to accept the deal."
+        : "The other party still needs to agree to the deal in the group.")
+    ).catch(() => {});
+
+    const updated = await dealService.findWithParties(dealId);
+    if (updated) await updateGroupDealCard(ctx, updated);
+
+    if (res.bothAgreed && updated) {
+      const amountStr = (updated.asset ?? "") === "INR"
+        ? formatMoney(updated.amount.toString(), "INR")
+        : formatMoney(updated.amount.toString(), updated.asset);
+      await notificationService.notifyAdmins(
+        `🤝 <b>BOTH PARTIES AGREED — DEAL READY</b>\n\n` +
+        `Deal: #${esc(updated.inviteCode)}\n` +
+        `Buyer: @${esc(updated.buyer?.username ?? "N/A")}\n` +
+        `Seller: @${esc(updated.seller?.username ?? "N/A")}\n` +
+        `Amount: <b>${amountStr}</b>\n\n` +
+        `Both parties agreed to the terms in the group. Accept the deal there to start the payment flow.`,
+        new InlineKeyboard().text("\u{1F6E1}\u{FE0F}  Accept Deal", `admin:accept_deal:${updated.id}`),
+        { dealId: updated.id }
+      );
+
+      for (const party of [updated.buyer, updated.seller]) {
+        if (!party?.telegramId) continue;
+        await ctx.api.sendMessage(
+          Number(party.telegramId),
+          `🤝 <b>DEAL #${esc(updated.inviteCode)}</b>\n\n` +
+          `Both parties have agreed to the terms.\n\n` +
+          `Waiting for the escrow admin to accept the deal. You will receive payment instructions here once it is accepted.`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      }
+    }
+  } catch (e: unknown) {
+    await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});
   }
 }

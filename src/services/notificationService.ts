@@ -51,7 +51,7 @@ export const notificationService = {
         `Amount: <b>${esc(amountStr)}</b>\n` +
         `Item: ${esc(description.slice(0, 100))}\n\n` +
         `🔐 Payment is manually verified by the escrower.\n\n` +
-        `The deal has been posted to the escrow group and is <b>waiting for the escrow admin to accept it</b>. You will receive payment instructions here once it is accepted.`,
+        `The deal has been posted to the escrow group. Please <b>agree to the deal there</b> so the escrow admin can accept it. You will receive payment instructions here once it is accepted.`,
         { parse_mode: "HTML" }
       );
     } catch (e) {
@@ -61,11 +61,34 @@ export const notificationService = {
 
   /**
    * Send a message (optionally with an inline keyboard) to every configured
-   * admin/escrower. Used for payment reports, release requests and disputes.
+   * admin/escrower. When `opts.dealId` (or `opts.groupId`) is given, the
+   * ACTIVE escrow admins assigned to that group are notified too — so a
+   * group-scoped workflow reaches the admins who actually run that group.
    */
-  async notifyAdmins(message: string, replyMarkup?: unknown) {
+  async notifyAdmins(message: string, replyMarkup?: unknown, opts?: { dealId?: string; groupId?: string }) {
     const b = await getBot();
-    const ids = [...config.adminTelegramIds];
+    const ids = new Set<number>([...config.adminTelegramIds]);
+
+    if (opts?.groupId) {
+      const groupAdmins = await prisma.groupAdmin.findMany({
+        where: { groupId: opts.groupId, status: "ACTIVE" },
+        include: { user: true },
+      });
+      for (const ga of groupAdmins) ids.add(Number(ga.user.telegramId));
+    } else if (opts?.dealId) {
+      const deal = await prisma.deal.findUnique({
+        where: { id: opts.dealId },
+        select: { groupChatId: true },
+      });
+      if (deal?.groupChatId) {
+        const groupAdmins = await prisma.groupAdmin.findMany({
+          where: { groupId: deal.groupChatId, status: "ACTIVE" },
+          include: { user: true },
+        });
+        for (const ga of groupAdmins) ids.add(Number(ga.user.telegramId));
+      }
+    }
+
     for (const tid of ids) {
       try {
         await b.api.sendMessage(tid, message, {

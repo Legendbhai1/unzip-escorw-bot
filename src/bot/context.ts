@@ -20,6 +20,9 @@ export interface SessionData {
   createDealCryptoPayer?: "BUYER" | "SELLER";
   createDealDescription?: string;
   createDealCategory?: string;
+  createDealDuration?: string;
+  createDealReleaseCondition?: string;
+  createDealRefundCondition?: string;
 
   // Last deal this user viewed/interacted with — used to resolve /release
   // and /refund in DM when no deal message is replied to.
