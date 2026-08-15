@@ -12,7 +12,13 @@ const transitions: StateTransition[] = [
   { from: "AWAITING_PAYMENT",   to: "PAYMENT_REPORTED",  triggeredBy: "BUYER",   condition: "Buyer reports manual payment (I've Paid)" },
   { from: "AWAITING_PAYMENT",   to: "PAYMENT_REPORTED",  triggeredBy: "SELLER",   condition: "Crypto payer (SELLER) reports manual payment (I've Paid)" },
   { from: "PAYMENT_REPORTED",   to: "AWAITING_PAYMENT",  triggeredBy: "ADMIN",   condition: "Escrower rejects the payment report — buyer may re-report" },
-  { from: "PAYMENT_REPORTED",   to: "FUNDED",            triggeredBy: "ADMIN",   condition: "Escrower manually verified payment (ONLY way to FUNDED)" },
+  // Terminal state for the current flow: the assigned escrow admin manually
+  // confirmed PAYMENT RECEIVED. The bot's scope ends here — the escrower
+  // continues delivery/payout manually outside the bot.
+  { from: "PAYMENT_REPORTED",   to: "PAYMENT_RECEIVED",   triggeredBy: "ADMIN",   condition: "Assigned escrow admin manually verified payment (ONLY way to PAYMENT_RECEIVED)" },
+  // LEGACY transition — kept for historical rows and the release/refund/
+  // dispute service tests (they seed FUNDED directly). New deals never use it.
+  { from: "PAYMENT_REPORTED",   to: "FUNDED",            triggeredBy: "ADMIN",   condition: "LEGACY: manual verification before PAYMENT_RECEIVED existed" },
   { from: "FUNDED",             to: "DELIVERED",         triggeredBy: "SELLER",  condition: "Seller marks delivered" },
   { from: "FUNDED",             to: "RELEASE_REQUESTED", triggeredBy: "BUYER",   condition: "Buyer requests release (partial or all)" },
   { from: "FUNDED",             to: "RELEASE_REQUESTED", triggeredBy: "SELLER",  condition: "Seller requests release (partial or all)" },
@@ -128,6 +134,7 @@ export const ACTIVE_STATES: ReadonlySet<DealStatus> = new Set([
   "JOINED",
   "AWAITING_PAYMENT",
   "PAYMENT_REPORTED",
+  // PAYMENT_RECEIVED is terminal for the current flow (no further bot steps).
   "FUNDED",
   "DELIVERED",
   "RELEASE_REQUESTED",
@@ -146,6 +153,9 @@ export const TERMINAL_STATES: ReadonlySet<DealStatus> = new Set([
   "RELEASED",
   "CANCELLED",
   "EXPIRED",
+  // Terminal for the current flow — the bot stops after the escrow admin
+  // confirms PAYMENT RECEIVED; delivery/payout continue manually.
+  "PAYMENT_RECEIVED",
 ]);
 
 /**

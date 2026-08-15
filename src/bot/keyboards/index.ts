@@ -82,18 +82,10 @@ export function dealActions(dealId: string, status: string) {
       .text("\u{274C}  Cancel Deal", `deal:cancel:${dealId}`);
   } else if (status === "PAYMENT_REPORTED") {
     k.text("\u{23F3}  Payment Under Verification", `deal:status:${dealId}`);
-  } else if (status === "FUNDED") {
-    k.text("\u{1F4E6}  Mark as Delivered", `deal:deliver:${dealId}`)
-      .row()
-      .text("\u{1F6A8}  Open Dispute", `deal:dispute:${dealId}`);
-  } else if (status === "DELIVERED") {
-    k.text("\u{2705}  Accept & Release", `deal:release:${dealId}`)
-      .row()
-      .text("\u{1F6A8}  Open Dispute", `deal:dispute:${dealId}`);
-  } else if (status === "RELEASE_REQUESTED" || status === "REFUND_REQUESTED") {
-    k.text("\u{23F3}  Awaiting Counterparty / Escrower", `deal:status:${dealId}`)
-      .row()
-      .text("\u{1F6A8}  Open Dispute", `deal:dispute:${dealId}`);
+  } else if (status === "PAYMENT_RECEIVED") {
+    // Terminal state for the current flow — the escrower continues delivery
+    // and payout manually outside the bot. No further bot actions.
+    k.text("\u{2705}  Deal Complete — Continue Manually", `deal:status:${dealId}`);
   } else if (status === "DISPUTED" || status === "UNDER_REVIEW") {
     k.text("\u{1F50D}  Under Review", `deal:status:${dealId}`);
   }

@@ -82,6 +82,18 @@ export async function showMyDeals(ctx: Ctx, tab: "active" | "completed" | "dispu
     deals = await dealService.getActiveDealsForUser(userId);
   } else if (tab === "completed") {
     deals = await dealService.getCompletedDealsForUser(userId);
+    // PAYMENT_RECEIVED is the terminal state of the current flow — deals that
+    // ended there belong in the user's completed history too.
+    const received = await prisma.deal.findMany({
+      where: {
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+        status: { in: ["PAYMENT_RECEIVED"] },
+      },
+      include: { buyer: true, seller: true },
+      orderBy: { completedAt: "desc" },
+      take: 50,
+    });
+    deals = [...received, ...deals];
   } else {
     deals = await prisma.deal.findMany({
       where: {
@@ -101,7 +113,7 @@ export async function showMyDeals(ctx: Ctx, tab: "active" | "completed" | "dispu
   const statusEmoji: Record<string, string> = {
     CREATED: "\u{1F9ED}", JOINED: "\u{1F91D}",
     AWAITING_PAYMENT: "\u{1F4B3}", PAYMENT_REPORTED: "\u{1F4DD}",
-    FUNDED: "\u{2705}", IN_PROGRESS: "\u{1F6E0}\u{FE0F}", DELIVERED: "\u{1F4E6}",
+    PAYMENT_RECEIVED: "\u{2705}", FUNDED: "\u{2705}", IN_PROGRESS: "\u{1F6E0}\u{FE0F}", DELIVERED: "\u{1F4E6}",
     RELEASE_PENDING: "\u{23F3}", RELEASE_REQUESTED: "\u{23F3}",
     DISPUTED: "\u{26A0}\u{FE0F}", UNDER_REVIEW: "\u{1F50D}",
     COMPLETED: "\u{2705}", REFUNDED: "\u{1F4B0}", RELEASED: "\u{1F4B8}",

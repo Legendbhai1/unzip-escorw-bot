@@ -9,7 +9,7 @@ import { esc, userMention } from "../lib/html.js";
 import { formatMoney, bpsToPercent } from "../lib/money.js";
 import { getPaymentInstructionsText, getAdminSetting, setAdminSetting, deleteAdminSetting, SETTING_KEYS, GLOBAL_GROUP_ID } from "../lib/paymentInstructions.js";
 import { isDealChatValid } from "../lib/flow.js";
-import { updateGroupDealCard } from "./scenes/dealForm.js";
+import { updateGroupDealCard, postPaymentInstructionsToGroupCard } from "./scenes/dealForm.js";
 import { userService } from "../services/userService.js";
 import { groupService } from "../services/groupService.js";
 
@@ -151,11 +151,20 @@ async function listPendingPayments(ctx: MyContext) {
 
   for (const deal of deals) {
     const report = deal.paymentReports[0];
-    const kb = new InlineKeyboard()
-      .text("\u{2705}  Payment Received", `admin:verify_payment:${deal.id}`)
-      .text("\u{274C}  Payment Not Received", `admin:reject_payment:${deal.id}`)
-      .row()
-      .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${deal.id}`);
+    // ONLY the admin who accepted this deal may verify it — everyone else sees
+    // a read-only entry (the verification buttons never reach another admin).
+    const isVerifier = !deal.acceptedBy || deal.acceptedBy === ctx.session.userId;
+    const assignedUsername = !isVerifier && deal.acceptedBy
+      ? (await userService.findById(deal.acceptedBy).catch(() => null))?.username
+      : undefined;
+
+    const kb = isVerifier
+      ? new InlineKeyboard()
+          .text("\u{2705}  Payment Received", `admin:verify_payment:${deal.id}`)
+          .text("\u{274C}  Payment Not Received", `admin:reject_payment:${deal.id}`)
+          .row()
+          .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${deal.id}`)
+      : new InlineKeyboard().text("\u{1F4CB}  View Deal", `deal:status:${deal.id}`);
 
     await ctx.reply(
       `<b>BUYER REPORTED PAYMENT</b>\n\n` +
@@ -166,7 +175,8 @@ async function listPendingPayments(ctx: MyContext) {
       `Reported at: ${esc(deal.paymentReportedAt?.toISOString() ?? "?")}\n` +
       (report?.reference ? `Reference: <code>${esc(report.reference)}</code>\n` : "") +
       (report?.notes ? `Notes: ${esc(report.notes)}\n` : "") +
-      (report?.evidence ? `Evidence: ${esc(report.evidence)}\n` : ""),
+      (report?.evidence ? `Evidence: ${esc(report.evidence)}\n` : "") +
+      (assignedUsername ? `\n⚠️ Verification is assigned to @${esc(assignedUsername)} — only they can confirm this payment.\n` : ""),
       { reply_markup: kb }
     );
   }
@@ -204,6 +214,27 @@ async function isAuthorizedForDealAction(telegramId: number, dealId: string): Pr
   });
   if (!deal?.groupChatId) return false;
   return groupService.isActiveGroupAdmin(deal.groupChatId, BigInt(telegramId));
+}
+
+/**
+ * Payment VERIFICATION is reserved for the admin who ACCEPTED the deal
+ * (acceptedBy). Another admin — even a global admin — gets "You are not the
+ * admin assigned to this deal." Server-side only; never trusts callback data.
+ * Legacy rows without an acceptedBy (pre-group flow) fall back to the generic
+ * router-level admin authorization already performed.
+ */
+async function isAssignedVerifier(dealId: string, userId: string): Promise<{ ok: boolean; acceptedByUsername?: string }> {
+  const deal = await prisma.deal.findUnique({
+    where: { id: dealId },
+    select: { acceptedBy: true },
+  });
+  if (!deal) return { ok: false };
+  if (!deal.acceptedBy) return { ok: true }; // legacy deal — generic admin auth applies
+  if (deal.acceptedBy !== userId) {
+    const accepter = await userService.findById(deal.acceptedBy).catch(() => null);
+    return { ok: false, acceptedByUsername: accepter?.username ?? undefined };
+  }
+  return { ok: true };
 }
 
 export async function handleAdminCallback(ctx: MyContext) {
@@ -347,9 +378,18 @@ export async function handleAdminCallback(ctx: MyContext) {
     return;
   }
 
-  // ── Manual payment verification ────────────────────────────────────
+  // ── Manual payment verification (ONLY the admin who accepted the deal) ──
   if (data.startsWith("admin:verify_payment:")) {
     const did = data.split(":")[2];
+    const verifier = await isAssignedVerifier(did, ctx.session.userId);
+    if (!verifier.ok) {
+      await ctx.answerCallbackQuery(
+        verifier.acceptedByUsername
+          ? `You are not the admin assigned to this deal (assigned to @${verifier.acceptedByUsername}).`
+          : "You are not the admin assigned to this deal."
+      ).catch(() => {});
+      return;
+    }
     const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
     if (!deal) return;
     const buyerFee = parseFloat(deal.amount.toString()) * deal.buyerFeeBps / 10000;
@@ -381,40 +421,31 @@ export async function handleAdminCallback(ctx: MyContext) {
 
   if (data.startsWith("admin:verify_confirm:")) {
     const did = data.split(":")[2];
+    const verifier = await isAssignedVerifier(did, ctx.session.userId);
+    if (!verifier.ok) {
+      await ctx.answerCallbackQuery(
+        verifier.acceptedByUsername
+          ? `You are not the admin assigned to this deal (assigned to @${verifier.acceptedByUsername}).`
+          : "You are not the admin assigned to this deal."
+      ).catch(() => {});
+      return;
+    }
     try {
       const result = await dealService.verifyPayment(did, ctx.session.userId);
       const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true, seller: true } });
       await ctx.editMessageText(
-        `<b>PAYMENT VERIFIED</b>\n\nDeal #${esc(deal?.inviteCode ?? did)} is now <b>FUNDED</b>.\n` +
+        `<b>PAYMENT RECEIVED</b>\n\nDeal #${esc(deal?.inviteCode ?? did)} — the escrower has confirmed the payment.\n` +
         `Buyer fee recorded: ${formatMoney(result.buyerFee, deal?.asset === "INR" ? "INR" : (deal?.asset ?? ""))}\n\n` +
         `Send the payment reference (optional) or <code>/skip</code>:`
       );
       ctx.session.pendingPaymentReferenceDealId = did;
       ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
 
-      // Notify both users in DM: payment verified by escrow admin.
+      // GROUP-FIRST: the group deal card is updated to the terminal
+      // PAYMENT_RECEIVED state ("🟢 PAYMENT RECEIVED ✅ — CONTINUE THE DEAL
+      // MANUALLY") and the bot stops. No party DMs, no release/refund/
+      // delivery buttons.
       if (deal) {
-        const verifiedMsg =
-          `🛡 <b>Deal #${esc(deal.inviteCode)}</b>\n\n` +
-          `Payment verified by escrow admin.\n` +
-          `@${esc(deal.buyer?.username ?? "buyer")} and @${esc(deal.seller?.username ?? "seller")}, continue the deal here.`;
-
-        if (deal.buyer?.telegramId) {
-          await ctx.api.sendMessage(Number(deal.buyer.telegramId), verifiedMsg, {
-            parse_mode: "HTML",
-            reply_markup: new InlineKeyboard()
-              .text("\u{1F4CB}  View Deal", `deal:status:${did}`)
-              .text("\u{1F6A8}  Dispute", `deal:dispute:${did}`),
-          });
-        }
-        if (deal.seller?.telegramId) {
-          await ctx.api.sendMessage(Number(deal.seller.telegramId), verifiedMsg, {
-            parse_mode: "HTML",
-            reply_markup: new InlineKeyboard()
-              .text("\u{1F4E6}  Mark as Delivered", `deal:deliver:${did}`)
-              .text("\u{1F6A8}  Dispute", `deal:dispute:${did}`),
-          });
-        }
         await updateGroupDealCard(ctx, deal);
       }
     } catch (e: unknown) {
@@ -425,6 +456,15 @@ export async function handleAdminCallback(ctx: MyContext) {
 
   if (data.startsWith("admin:reject_payment:")) {
     const did = data.split(":")[2];
+    const verifier = await isAssignedVerifier(did, ctx.session.userId);
+    if (!verifier.ok) {
+      await ctx.answerCallbackQuery(
+        verifier.acceptedByUsername
+          ? `You are not the admin assigned to this deal (assigned to @${verifier.acceptedByUsername}).`
+          : "You are not the admin assigned to this deal."
+      ).catch(() => {});
+      return;
+    }
     ctx.session.pendingRejectPaymentDealId = did;
     ctx.session.pendingFlowChatId = String(ctx.chat?.id ?? "");
     await ctx.editMessageText(
@@ -436,6 +476,15 @@ export async function handleAdminCallback(ctx: MyContext) {
 
   if (data.startsWith("admin:request_evidence:")) {
     const did = data.split(":")[2];
+    const verifier = await isAssignedVerifier(did, ctx.session.userId);
+    if (!verifier.ok) {
+      await ctx.answerCallbackQuery(
+        verifier.acceptedByUsername
+          ? `You are not the admin assigned to this deal (assigned to @${verifier.acceptedByUsername}).`
+          : "You are not the admin assigned to this deal."
+      ).catch(() => {});
+      return;
+    }
     const deal = await prisma.deal.findUnique({ where: { id: did }, include: { buyer: true } });
     if (deal?.buyer?.telegramId) {
       await ctx.api.sendMessage(Number(deal.buyer.telegramId),
@@ -863,63 +912,6 @@ export async function setSettingValue(key: string, value: string, adminUserId: s
 // GROUP DEAL ACCEPTANCE + PAYMENT INSTRUCTIONS
 // ═══════════════════════════════════════════════════════════════════
 
-/** Send the payment-required message + instructions to both parties. */
-async function sendPaymentInstructionsToParties(ctx: MyContext, deal: any) {
-  const buyer = deal.buyer;
-  const seller = deal.seller;
-  const payerId = dealService.getPayerId(deal);
-  const payerIsBuyer = payerId === deal.buyerId;
-  const payerUser = payerIsBuyer ? buyer : seller;
-
-  const instructions = await getPaymentInstructionsText(deal);
-  const buyerFee = parseFloat(deal.amount.toString()) * deal.buyerFeeBps / 10000;
-  const totalPaid = parseFloat(deal.amount.toString()) + buyerFee;
-  const amountStr = (deal.asset ?? "") === "INR" ? formatMoney(deal.amount.toString(), "INR") : formatMoney(deal.amount.toString(), deal.asset);
-  const cryptoPayerLine = deal.paymentMethod !== "INR"
-    ? `Crypto payer: ${userMention(payerUser?.telegramId, payerUser?.username)}\n`
-    : "";
-
-  // The DM message tags the deal and the payer, and names both parties, so the
-  // payer always knows exactly which deal and which party they are paying for.
-  const header =
-    `🛡 <b>ESCROW DEAL #${esc(deal.inviteCode)}</b>\n\n` +
-    `🔐 <b>PAYMENT REQUIRED</b>\n\n` +
-    `Deal: #${esc(deal.inviteCode)}\n` +
-    `Buyer: ${userMention(buyer?.telegramId, buyer?.username)}\n` +
-    `Seller: ${userMention(seller?.telegramId, seller?.username)}\n` +
-    `Payment method: <b>${deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20"}</b>\n` +
-    cryptoPayerLine +
-    `Amount: <b>${amountStr}</b> + applicable buyer fee\n` +
-    `Buyer fee: ${formatMoney(buyerFee, deal.asset === "INR" ? "INR" : deal.asset)} — total to pay: <b>${formatMoney(totalPaid, deal.asset === "INR" ? "INR" : deal.asset)}</b>\n\n` +
-    `💳 <b>How to pay:</b>\n${instructions}\n\n` +
-    `Payment is verified manually by the escrow admin. Only send money to the details above.`;
-
-  for (const [user, isPayer] of [[buyer, payerIsBuyer], [seller, !payerIsBuyer]] as const) {
-    if (!user?.telegramId) continue;
-    const kb = new InlineKeyboard();
-    if (isPayer) {
-      kb.text("\u{2705}  Payment Sent / Check Payment", `deal:paid:${deal.id}`);
-    } else {
-      kb.text("\u{1F4CB}  View Deal", `deal:status:${deal.id}`);
-    }
-    kb.row().text("\u{1F3E0}  Main Menu", "menu:main");
-    try {
-      await ctx.api.sendMessage(Number(user.telegramId), header, { parse_mode: "HTML", reply_markup: kb });
-    } catch (_e) { /* user may have blocked the bot */ }
-  }
-
-  await prisma.deal.update({
-    where: { id: deal.id },
-    data: { paymentInstructionsSentAt: new Date() },
-  });
-  await prisma.escrowAuditLog.create({
-    data: {
-      dealId: deal.id, action: "PAYMENT_INSTRUCTIONS_SENT",
-      notes: `Payment instructions sent (payer: @${payerUser?.username ?? "N/A"})`,
-    },
-  });
-}
-
 /** Escrow admin accepts a deal from the group card. Server-side checks (never
  *  trusts callback data): the deal exists, belongs to an APPROVED group, the
  *  callback comes from that group, BOTH parties agreed, and the clicker is the
@@ -959,11 +951,14 @@ async function acceptDealFromGroup(ctx: MyContext, dealId: string) {
 
     const updated = await prisma.deal.findUnique({ where: { id: dealId }, include: { buyer: true, seller: true } });
     if (updated) {
-      await sendPaymentInstructionsToParties(ctx, updated);
-      await updateGroupDealCard(ctx, {
-        ...updated,
-        acceptedByUsername: ctx.session.username ?? ctx.session.firstName,
-      });
+      // GROUP-FIRST: the deal card itself becomes the payment instructions
+      // (amount + this group's escrow details + [I've Paid]) — nothing is
+      // DMed to the parties.
+      await postPaymentInstructionsToGroupCard(
+        ctx,
+        updated,
+        ctx.session.username ?? ctx.session.firstName
+      );
     }
   } catch (e: unknown) {
     await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});

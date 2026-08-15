@@ -37,25 +37,29 @@ and personally pays the seller / refunds the buyer outside the bot.
 - **Admin acceptance**: only the bot owner, a global admin, or an ACTIVE
   escrow admin for the deal's group can press `Accept Deal` (checked
   server-side, and only after both parties agreed). The deal moves to
-  `AWAITING_PAYMENT`, `acceptedBy` / `acceptedAt` are recorded, the group card
-  is updated, and both parties receive the escrower's payment instructions in
-  DM. Duplicate acceptance is rejected and shows who already accepted.
+  `AWAITING_PAYMENT`, `acceptedBy` / `acceptedAt` are recorded, and the group
+  card itself becomes the payment instructions for THAT group: the exact
+  amount to pay, the escrower's configured receiving details (scoped to the
+  deal's group) and an `[I've Paid]` button for the payer. No payment details
+  are DMed to the parties. Duplicate acceptance is rejected and shows who
+  already accepted.
 - **Manual payment**: the payer (buyer, or the configured crypto payer for
   USDT deals) pays the escrower directly using the **admin-entered** payment
   details, then taps **Payment Sent / Check Payment** — this only creates a
   `PAYMENT_REPORTED` record. It NEVER funds the deal.
-- **Manual verification**: only an authorized admin can verify the payment —
-  this is the ONLY way a deal becomes `FUNDED`. The bot never infers payment
-  from blockchain events, screenshots, "I paid" or hashes. Both parties are
-  then notified in DM ("Payment verified by escrow admin. @buyer and @seller,
-  continue the deal here.") with the appropriate controls.
-- **Release / Refund (partial or full)**: `/release all`, `/release 50`,
-  `/refund all`, `/refund 50` — works by replying to the deal message (or in
-  DM, on the last deal you viewed, optionally with the deal code). A release or
-  refund request is never executed immediately: the counterparty must agree
-  (`[Agree] [Reject] [Dispute]`), then the admin is notified, pays/refunds
-  manually outside the bot, and clicks `Mark Release/Refund Completed`.
-  Partial amounts keep the deal active with the remaining balance tracked.
+- **Manual verification**: ONLY the admin who **accepted** the deal
+  (`acceptedBy`) can verify its payment — other admins are never notified and
+  their callbacks are rejected server-side. This is the ONLY way a deal
+  becomes `PAYMENT_RECEIVED`, the terminal state of the bot. The bot never
+  infers payment from blockchain events, screenshots, "I paid" or hashes.
+  The group card is updated to 🟢 `PAYMENT RECEIVED` and the bot stops — no
+  party DMs, no release/refund/delivery buttons.
+- **The bot stops at PAYMENT_RECEIVED**: delivery, payout and refunds happen
+  **manually outside the bot**. `/release`, `/refund` and the old
+  deliver/release/refund buttons are disabled (they answer with a clear
+  message and never touch a deal). The service-layer release/refund/dispute
+  code remains in the repo for historical rows and audit, but the current
+  flow never reaches it.
 - **Fees**: 1% buyer + 1% seller (configurable via `BUYER_FEE_BPS` /
   `SELLER_FEE_BPS`), shown explicitly in the summary and admin screens.
   E.g. ₹10,000 deal: buyer pays ₹10,100, seller receives ₹9,900, escrower earns
@@ -75,9 +79,9 @@ and personally pays the seller / refunds the buyer outside the bot.
   `MANUAL_REFUND_CONFIRMED`, `FEE_RECORDED`, `DISPUTE_OPENED`,
   `DISPUTE_RESOLVED`) is recorded in `escrow_audit_logs` with deal, actor,
   amount, currency, reference and time.
-- **Disputes**: either party can open a dispute after payment is verified;
-  admins review and resolve by **manual refund** (`REFUNDED`) or **manual
-  release** (`RELEASED`).
+- **Disputes**: legacy flow kept for historical rows; the current bot ends at
+  `PAYMENT_RECEIVED`, so disputes after that point are handled manually
+  outside the bot.
 
 ## Payment methods (only these two)
 
@@ -92,7 +96,7 @@ and personally pays the seller / refunds the buyer outside the bot.
 |---|---|---|
 | `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `DATABASE_URL` | ✅ | PostgreSQL URL (Prisma migrations auto-apply on deploy) |
-| `ADMIN_TELEGRAM_IDS` | ✅ | Comma-separated global admin/escrower Telegram IDs (they can accept deals, verify payment, complete releases/refunds, resolve disputes, edit payment settings, in every group) |
+| `ADMIN_TELEGRAM_IDS` | ✅ | Comma-separated global admin/escrower Telegram IDs (they can accept deals, verify payment, edit payment settings; group-scoped escrow admins via `/addadmin` too) |
 | `ESCROW_GROUP_ID` | ⚠️ | Fallback chat id of the escrow group where deal cards are posted. Can also be set at runtime via `/settings` → `escrow_group_id` (the DB value takes precedence). The group must also be authorized by the owner with `/allowgroup`; if unset, the first approved group is used |
 | `BOT_OWNER_TELEGRAM_ID` | ⚠️ | The single bot owner who can run `/allowgroup`, `/disallowgroup`, `/addadmin`, `/removeadmin`, `/groupadmins`. Falls back to the first `ADMIN_TELEGRAM_IDS` entry when unset |
 
@@ -140,19 +144,19 @@ CREATE DEAL (button / /form / "form")
   → BUYER [✅ Agree to Deal] → SELLER [✅ Agree to Deal] (bot records who clicked)
   → BOTH AGREED → Status: WAITING FOR ADMIN → owner + group admins notified
   → GROUP ESCROW ADMIN [🛡 Accept Deal] → AWAITING_PAYMENT (acceptedBy/acceptedAt recorded)
-  → PAYMENT INSTRUCTIONS sent to both parties in DM
+  → THE GROUP CARD BECOMES THE PAYMENT INSTRUCTIONS: exact amount + that
+    group's escrow details + [I've Paid] (nothing DMed to the parties)
   → PAYER PAYS ESCROWER MANUALLY (INR: buyer pays UPI · USDT: the configured crypto payer)
-  → PAYER REPORTS (Payment Sent) → PAYMENT_REPORTED
-  → ADMIN MANUALLY VERIFIES → FUNDED → both notified in DM
-  → SELLER DELIVERS → DELIVERED
-  → RELEASE/REFUND REQUEST (/release 50 | /refund all …)
-  → COUNTERPARTY AGREES → admin notified
-  → ADMIN MANUALLY PAYS/REFUNDS → Mark Release/Refund Completed
-  → COMPLETED / REFUNDED (partial amounts keep the deal active)
+  → PAYER REPORTS (I've Paid) → PAYMENT_REPORTED → group card updated
+  → ONLY THE ASSIGNED ADMIN gets the verification prompt in DM
+  → ASSIGNED ADMIN MANUALLY VERIFIES → PAYMENT_RECEIVED ✅ → group card updated → STOP
+  → THE BOT'S JOB IS DONE — delivery/payout continue manually outside the bot
 ```
 
-Disputes: `FUNDED/DELIVERED/RELEASE_REQUESTED/REFUND_REQUESTED → DISPUTED →
-UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
+The assigned admin (the one who clicked Accept Deal) is the ONLY person who
+can confirm or reject the payment — this is enforced server-side, row-locked.
+The old `FUNDED → deliver → release/refund` machine remains in the codebase
+for historical rows and audit only; the current flow never reaches it.
 
 ## Commands
 
@@ -175,10 +179,9 @@ UNDER_REVIEW → MANUAL_REFUND (REFUNDED)` or `MANUAL_RELEASE (RELEASED)`.
   (global admins only). Inside a group: that group's own details (bot owner /
   global admin / that group's escrow admin)
 - `/disputes`, `/review`, `/ban`, `/suspend`, `/user` — admin tooling
-- `/release all` | `/release 50` — request a (partial) release; reply to the
-  deal message in the group, or use your last viewed deal in DM (optionally
-  pass the deal code)
-- `/refund all` | `/refund 50` — request a (partial) refund (same context)
+- `/release` / `/refund` — **out of scope**: the bot ends at
+  PAYMENT_RECEIVED; these commands answer with a message pointing to the
+  manual escrower and never touch a deal
 
 ## Telegram group setup (permissions)
 
@@ -192,8 +195,8 @@ per group with `/addadmin @user`. Recommended permissions:
   bot reliably receives messages in the group. This matters for:
   - `/form` and the word `form` in the group (the bot must see the message to
     start the deal form there);
-  - `/release all`, `/release 50`, `/refund all`, `/refund 50` when sent as a
-    reply to a deal card in the group;
+  - old `/release` / `/refund` commands sent as replies (they now answer with
+    the out-of-scope message and never touch a deal);
   - making `@username` text into links (admin rights are required for Telegram
     to render `@`-mentions; the bot's own deal card instead uses
     `tg://user?id=…` links, which work without admin rights).

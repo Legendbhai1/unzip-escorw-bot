@@ -18,6 +18,12 @@ enum DealStatus {
   // Manual-payment flow states.
   AWAITING_PAYMENT
   PAYMENT_REPORTED
+  // Terminal state for the current flow: the assigned escrow admin manually
+  // confirmed PAYMENT RECEIVED. The bot's scope ends here — the escrower
+  // continues delivery/payout manually outside the bot.
+  PAYMENT_RECEIVED
+  // Legacy state — kept for historical rows + the release/refund/dispute
+  // service tests. New deals never enter it.
   FUNDED
   IN_PROGRESS
   DELIVERED
@@ -68,6 +74,7 @@ enum EscrowAuditAction {
   PAYMENT_INSTRUCTIONS_SENT
   PAYMENT_REPORTED
   PAYMENT_VERIFIED
+  PAYMENT_RECEIVED
   PAYMENT_REJECTED
   EVIDENCE_REQUESTED
   EVIDENCE_SUBMITTED

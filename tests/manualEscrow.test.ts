@@ -211,20 +211,20 @@ describe("Manual escrow full flow (INR)", () => {
     expect(audit!.currency).toBe("INR");
   });
 
-  it("only the ADMIN can verify payment -> FUNDED (buyer cannot)", async () => {
+  it("only the ADMIN can verify payment -> PAYMENT_RECEIVED (buyer cannot)", async () => {
     const deal = await createDeal("INR", "10000");
     await toAwaitingPayment(deal.id);
     await dealService.reportPayment(deal.id, BUYER_ID, { reference: "REF-X" });
 
     // Buyer / seller cannot trigger verification.
-    expect(canTransition("PAYMENT_REPORTED", "FUNDED", "BUYER")).toBeNull();
-    expect(canTransition("PAYMENT_REPORTED", "FUNDED", "SELLER")).toBeNull();
-    expect(canTransition("PAYMENT_REPORTED", "FUNDED", "ADMIN")).not.toBeNull();
+    expect(canTransition("PAYMENT_REPORTED", "PAYMENT_RECEIVED", "BUYER")).toBeNull();
+    expect(canTransition("PAYMENT_REPORTED", "PAYMENT_RECEIVED", "SELLER")).toBeNull();
+    expect(canTransition("PAYMENT_REPORTED", "PAYMENT_RECEIVED", "ADMIN")).not.toBeNull();
 
     const result = await dealService.verifyPayment(deal.id, ADMIN_ID);
 
     const updated = await prisma.deal.findUnique({ where: { id: deal.id } });
-    expect(updated?.status).toBe("FUNDED");
+    expect(updated?.status).toBe("PAYMENT_RECEIVED"); // terminal — bot stops here
     expect(updated?.paymentVerifiedBy).toBe(ADMIN_ID);
     expect(updated?.paymentVerifiedAt).not.toBeNull();
     expect(parseFloat(updated!.buyerFeeAmount.toString())).toBe(100); // 1% of 10,000 INR
@@ -267,11 +267,14 @@ describe("Manual escrow full flow (INR)", () => {
     expect((await prisma.deal.findUnique({ where: { id: deal.id } }))?.status).toBe("PAYMENT_REPORTED");
   });
 
-  it("deliver -> accept -> RELEASE_REQUESTED -> admin manual release -> COMPLETED", async () => {
+  it("deliver -> accept -> RELEASE_REQUESTED -> admin manual release -> COMPLETED (legacy release machinery, seeded at FUNDED)", async () => {
     const deal = await createDeal("INR", "10000");
     await toAwaitingPayment(deal.id);
     await dealService.reportPayment(deal.id, BUYER_ID, { reference: "REF-Z" });
-    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    // The current bot flow ends at PAYMENT_RECEIVED; the release machinery below
+    // is legacy service logic kept for historical rows, so seed FUNDED directly
+    // (including the buyer fee that verifyPayment would have recorded).
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED", buyerFeeAmount: "100" } });
 
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
     expect((await prisma.deal.findUnique({ where: { id: deal.id } }))?.status).toBe("DELIVERED");
@@ -320,11 +323,12 @@ describe("Manual escrow full flow (INR)", () => {
     expect(await prisma.balance.findFirst({ where: { userId: SELLER_ID } })).toBeNull();
   });
 
-  it("dispute after verification -> manual refund -> REFUNDED", async () => {
+  it("dispute after verification -> manual refund -> REFUNDED (legacy dispute machinery, seeded at FUNDED)", async () => {
     const deal = await createDeal("CRYPTO", "100");
     await toAwaitingPayment(deal.id);
     await dealService.reportPayment(deal.id, BUYER_ID, {});
-    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    // Legacy dispute path — seed the historical post-verification state.
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED" } });
 
     await dealService.openDispute(deal.id, BUYER_ID, "Item never delivered");
     expect((await prisma.deal.findUnique({ where: { id: deal.id } }))?.status).toBe("DISPUTED");
@@ -347,11 +351,12 @@ describe("Manual escrow full flow (INR)", () => {
     expect(dispute?.resolution).toBe("REFUND_BUYER");
   });
 
-  it("dispute -> manual release to seller -> RELEASED", async () => {
+  it("dispute -> manual release to seller -> RELEASED (legacy dispute machinery, seeded at FUNDED)", async () => {
     const deal = await createDeal("CRYPTO", "100");
     await toAwaitingPayment(deal.id);
     await dealService.reportPayment(deal.id, BUYER_ID, {});
-    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    // Legacy dispute path — seed the historical post-verification state.
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED" } });
 
     await dealService.openDispute(deal.id, SELLER_ID, "Buyer refusing to accept");
     await dealService.transition(deal.id, "UNDER_REVIEW", "ADMIN");
@@ -377,7 +382,8 @@ describe("Manual escrow full flow (INR)", () => {
     expect(canTransition("PAYMENT_REPORTED", "AWAITING_PAYMENT", "BUYER")).toBeNull();
 
     // Only participants can request release (a non-participant cannot).
-    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    // Legacy release machinery — seed the historical post-verification state.
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED", buyerFeeAmount: "10" } });
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
     await expect(dealService.requestRelease(deal.id, ADMIN_ID)).rejects.toThrow();
 
@@ -410,6 +416,8 @@ describe("Fee calculation (INR example from spec)", () => {
     expect(parseFloat(verify.totalPaid)).toBe(10100); // buyer total
     expect(parseFloat(verify.buyerFee)).toBe(100);
 
+    // Legacy release machinery — seed the historical post-verification state.
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED", buyerFeeAmount: "100" } });
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
     await dealService.requestRelease(deal.id, BUYER_ID);
     await dealService.agreeRelease(deal.id, SELLER_ID, true);
@@ -419,19 +427,18 @@ describe("Fee calculation (INR example from spec)", () => {
     expect(parseFloat(release.escrowFee)).toBe(200); // escrower earns
   });
 
-  it("state machine exposes the manual happy path", () => {
+  it("state machine exposes the manual happy path (current: ends at PAYMENT_RECEIVED)", () => {
     const happy: Array<[any, any, any]> = [
       ["CREATED", "JOINED", "SELLER"],
       ["JOINED", "AWAITING_PAYMENT", "SYSTEM"],
       ["AWAITING_PAYMENT", "PAYMENT_REPORTED", "BUYER"],
-      ["PAYMENT_REPORTED", "FUNDED", "ADMIN"],
-      ["FUNDED", "DELIVERED", "SELLER"],
-      ["DELIVERED", "RELEASE_REQUESTED", "BUYER"],
-      ["RELEASE_REQUESTED", "COMPLETED", "ADMIN"],
+      ["PAYMENT_REPORTED", "PAYMENT_RECEIVED", "ADMIN"],
     ];
     for (const [from, to, by] of happy) {
       expect(canTransition(from, to, by), `${from}->${to} by ${by}`).not.toBeNull();
     }
+    // The legacy FUNDED release path remains for historical rows only.
+    expect(canTransition("PAYMENT_REPORTED", "FUNDED", "ADMIN")).not.toBeNull();
   });
 
   it("disputes are only possible after payment is verified", () => {
@@ -539,12 +546,16 @@ describe("Crypto payer (USDT BEP20)", () => {
 // ═══════════════════════════════════════════════════════════════════
 
 describe("Partial release & refund", () => {
+  /** Legacy release/refund machinery — the bot ends at PAYMENT_RECEIVED now,
+   *  so these tests seed the historical post-verification FUNDED state and
+   *  mark the deal delivered directly. */
   async function fundedDeal(amount = "100") {
     const deal = await createDeal("CRYPTO", amount);
     await agreeBoth(deal.id);
     await dealService.adminAccept(deal.id, ADMIN_ID);
     await dealService.reportPayment(deal.id, BUYER_ID, {});
-    await dealService.verifyPayment(deal.id, ADMIN_ID);
+    // 1% buyer fee on the deal amount, as verifyPayment would have recorded.
+    await prisma.deal.update({ where: { id: deal.id }, data: { status: "FUNDED", buyerFeeAmount: (parseFloat(amount) * 0.01).toString() } });
     await dealService.transition(deal.id, "DELIVERED", "SELLER");
     return deal;
   }

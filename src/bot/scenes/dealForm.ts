@@ -11,6 +11,7 @@ import { esc, userMention } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import { parseDurationDeadline } from "../../lib/dealTerms.js";
 import { newFlowToken, isFlowExpired, isFlowChatValid, isDealChatValid, splitCallbackToken, FLOW_TTL_MS } from "../../lib/flow.js";
+import { getPaymentInstructionsText, hasPaymentInstructions } from "../../lib/paymentInstructions.js";
 import { activeFormOptions, backToMain } from "../keyboards/index.js";
 import type { MyContext } from "../context.js";
 
@@ -161,6 +162,40 @@ function advanceFlow(ctx: MyContext): string {
   return s.flowToken;
 }
 
+// ── Prompt deletion (message simplification) ───────────────────────────
+// When moving to the next form step, the previous bot question is deleted and
+// replaced by the newest one, so old temporary prompts disappear. The group
+// deal CARD is never tracked/deleted — it is the deal reference.
+
+export async function deleteLastPrompt(ctx: MyContext) {
+  const { lastPromptChatId, lastPromptMessageId } = ctx.session;
+  if (
+    lastPromptMessageId &&
+    lastPromptChatId &&
+    lastPromptChatId === String(ctx.chat?.id ?? "")
+  ) {
+    try {
+      await ctx.api.deleteMessage(lastPromptChatId, lastPromptMessageId);
+    } catch { /* user may have deleted it / permissions — safe to continue */ }
+  }
+  ctx.session.lastPromptChatId = undefined;
+  ctx.session.lastPromptMessageId = undefined;
+}
+
+export function trackLastPrompt(ctx: MyContext, messageId: number | undefined) {
+  if (messageId == null) return;
+  ctx.session.lastPromptChatId = String(ctx.chat?.id ?? "");
+  ctx.session.lastPromptMessageId = messageId;
+}
+
+/** Send a NEW prompt message, deleting the previous one first. */
+async function sendNextPrompt(ctx: MyContext, text: string, kb?: InlineKeyboard) {
+  await deleteLastPrompt(ctx);
+  const sent = await ctx.reply(text, kb ? { reply_markup: kb } : {});
+  trackLastPrompt(ctx, sent.message_id);
+  return sent;
+}
+
 export function paymentLabel(method?: string): string {
   return method === "INR" ? "INR / UPI" : "USDT BEP20";
 }
@@ -290,7 +325,7 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     }
     const prompt = renderCurrentStep(ctx);
     const kb = formKeyboard(s.createDealStep as DealFormStep, s.flowToken ?? "");
-    await ctx.reply(prompt ?? "<b>CREATE DEAL</b>", { reply_markup: kb });
+    await sendNextPrompt(ctx, prompt ?? "<b>CREATE DEAL</b>", kb);
     return true;
   }
   if (action === "form:restart") {
@@ -354,13 +389,14 @@ export async function processDealFormCallback(ctx: MyContext, data: string): Pro
     return true;
   }
 
-  // ── Category ──
+  // ── Category → Description (text step) ──
   if (action.startsWith("form:cat:")) {
     s.createDealCategory = action.replace("form:cat:", "");
-    s.createDealStep = "deal_duration";
+    s.createDealStep = "description";
     advanceFlow(ctx);
     await ctx.editMessageText(
-      "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
+      "<b>CATEGORY</b>: <b>" + esc(s.createDealCategory.replace(/_/g, " ")) + "</b>\n\n" +
+      "Enter the <b>deal details</b> (what is being traded):\n\n<i>Example: Logo design for a website</i>",
       { reply_markup: backToMain }
     );
     return true;
@@ -439,11 +475,11 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealCounterpartyUserId = otherUser.id;
     s.createDealStep = "amount";
     advanceFlow(ctx);
-    await ctx.reply(
+    await sendNextPrompt(
+      ctx,
       s.createDealPaymentMethod === "INR"
-        ? "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>INR</b>:\n\n<i>Example: 10000</i>"
-        : "<b>DEAL AMOUNT</b>\n\nEnter the amount in <b>USDT</b>:\n\n<i>Example: 100</i>",
-      { reply_markup: backToMain }
+        ? "Enter the amount in <b>INR</b>:\n\n<i>Example: 10000</i>"
+        : "Enter the amount in <b>USDT</b>:\n\n<i>Example: 100</i>"
     );
     return true;
   }
@@ -465,17 +501,17 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
 
     if (s.createDealPaymentMethod === "CRYPTO") {
       s.createDealStep = "crypto_payer";
-      await ctx.reply(
-        "Who is <b>paying USDT to the escrow</b>?\n\n" +
-        "In both cases the escrower manually holds and verifies the real funds — the bot only records the payment.",
-        { reply_markup: formKeyboard("crypto_payer", advanceFlow(ctx)) }
+      await sendNextPrompt(
+        ctx,
+        "Who is <b>paying USDT to the escrow</b>?",
+        formKeyboard("crypto_payer", advanceFlow(ctx))
       );
     } else {
       // INR: asset=INR, network=UPI.
       s.createDealAsset = "INR";
       s.createDealNetwork = "UPI";
       s.createDealStep = "category";
-      await ctx.reply("<b>CATEGORY</b>\n\nSelect the trade category:", { reply_markup: formKeyboard("category", advanceFlow(ctx)) });
+      await sendNextPrompt(ctx, "<b>CATEGORY</b>\n\nSelect the trade category:", formKeyboard("category", advanceFlow(ctx)));
     }
     return true;
   }
@@ -489,9 +525,9 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealDescription = text;
     s.createDealStep = "deal_duration";
     advanceFlow(ctx);
-    await ctx.reply(
-      "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nThis is a <b>deadline/term</b> only — the bot never auto-refunds or auto-releases money when it passes.",
-      { reply_markup: backToMain }
+    await sendNextPrompt(
+      ctx,
+      "<b>DEAL DURATION</b>\n\nHow long will this deal take?\n\n<i>Example: 7 days, 48 hours, 30 days</i>\n\nTerm/deadline only — never auto-enforced."
     );
     return true;
   }
@@ -505,9 +541,9 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealDuration = text.trim();
     s.createDealStep = "release_condition";
     advanceFlow(ctx);
-    await ctx.reply(
-      "<b>RELEASE CONDITION</b>\n\nWhen should the escrowed payment be <b>released to the seller</b>?\n\n<i>Example: After the buyer receives and approves the work</i>",
-      { reply_markup: backToMain }
+    await sendNextPrompt(
+      ctx,
+      "<b>RELEASE CONDITION</b>\n\nWhen should the payment be <b>released to the seller</b>?\n\n<i>Example: After the buyer receives and approves the work</i>"
     );
     return true;
   }
@@ -521,9 +557,10 @@ export async function processDealFormText(ctx: MyContext, text: string): Promise
     s.createDealReleaseCondition = text;
     s.createDealStep = "refund_condition";
     advanceFlow(ctx);
-    await ctx.reply(
-      "<b>REFUND CONDITION</b>\n\nUnder what circumstances should the <b>buyer receive a refund</b>?\n\n<i>Example: If the seller does not deliver within the agreed duration</i>",
-      { reply_markup: backToMain }
+    await sendNextPrompt(
+      ctx,
+      "<b>REFUND CONDITION</b>\n\nWhen can the payment be <b>refunded</b>?\n\n<i>Example: If the seller does not deliver within the agreed duration</i>",
+      backToMain
     );
     return true;
   }
@@ -577,7 +614,8 @@ export async function previewDealForm(ctx: MyContext) {
     ? `↩️ Refund condition:\n${esc(s.createDealRefundCondition)}\n`
     : "";
 
-  await ctx.reply(
+  await sendNextPrompt(
+    ctx,
     `<b>CREATE ESCROW</b>\n\n` +
     `Payment: <b>${paymentLabel(s.createDealPaymentMethod)}</b>\n` +
     cryptoPayerLine +
@@ -594,7 +632,7 @@ export async function previewDealForm(ctx: MyContext) {
     releaseLine +
     refundLine +
     `🔐 Payment is manually verified by the escrower.`,
-    { reply_markup: formKeyboard("preview", ctx.session.flowToken ?? "") }
+    formKeyboard("preview", ctx.session.flowToken ?? "")
   );
 }
 
@@ -604,6 +642,7 @@ function groupStatusLabel(status: string): string {
     JOINED: "WAITING FOR ADMIN",
     AWAITING_PAYMENT: "AWAITING PAYMENT",
     PAYMENT_REPORTED: "PAYMENT REPORTED",
+    PAYMENT_RECEIVED: "🟢 PAYMENT RECEIVED ✅ — CONTINUE THE DEAL MANUALLY",
     FUNDED: "FUNDED — PAYMENT VERIFIED",
     DELIVERED: "DELIVERED",
     RELEASE_REQUESTED: "RELEASE REQUESTED",
@@ -811,6 +850,9 @@ export async function createDealFromForm(ctx: MyContext) {
     logger.warn({ err: e }, "Deal form creation failed");
     await ctx.reply(`Error: ${esc(msg)}`, { reply_markup: backToMain });
   }
+  // The temporary form prompts (including the preview) disappear — the group
+  // deal card remains as the deal reference.
+  await deleteLastPrompt(ctx).catch(() => {});
   clearForm(ctx);
 }
 
@@ -896,6 +938,89 @@ export async function updateGroupDealCard(ctx: MyContext, deal: any) {
 }
 
 /**
+ * After the escrow admin ACCEPTS a deal, the group deal card itself becomes
+ * the payment instructions: who accepted, the exact amount to pay, the
+ * escrower's manually-configured receiving details scoped to THIS group, and
+ * the [I've Paid] button for the payer. Nothing is DMed to the parties — the
+ * group card is the deal reference and the single source of truth.
+ * Also records the PAYMENT_INSTRUCTIONS_SENT audit event.
+ */
+export async function postPaymentInstructionsToGroupCard(
+  ctx: MyContext,
+  deal: any,
+  acceptedByUsername?: string | null,
+  rejectionReason?: string
+) {
+  if (!deal?.groupChatId || !deal?.groupMessageId) return;
+
+  const buyer = deal.buyerId ? await userService.findById(deal.buyerId) : null;
+  const seller = deal.sellerId ? await userService.findById(deal.sellerId) : null;
+
+  const payerId = dealService.getPayerId(deal);
+  const payerIsBuyer = payerId === deal.buyerId;
+  const payerUser = payerIsBuyer ? buyer : seller;
+
+  const amount = parseFloat(deal.amount.toString());
+  const buyerFee = amount * (deal.buyerFeeBps ?? config.buyerFeeBps) / 10000;
+  const totalPaid = amount + buyerFee;
+  const isInr = (deal.asset ?? "") === "INR";
+
+  const configured = await hasPaymentInstructions(deal);
+  const methodLabel = deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20";
+  const instructions = configured
+    ? `💳 <b>How to pay:</b>\n${await getPaymentInstructionsText(deal)}\n`
+    : `❌ <b>${deal.paymentMethod === "INR" ? "UPI" : "USDT BEP20"} payment isn't configured for this group.</b>\nAsk an admin to run /settings.\n`;
+
+  const acceptedByLine = acceptedByUsername ? `Accepted by: @${esc(acceptedByUsername)}\n` : "";
+  const payerLine = deal.paymentMethod !== "INR"
+    ? `Payer: ${userMention(payerUser?.telegramId, payerUser?.username)}\n`
+    : "";
+  const rejectionLine = rejectionReason
+    ? `\n⚠️ Your previous payment report was rejected: ${esc(rejectionReason)}\nPay again and tap <b>I've Paid</b>.\n`
+    : "";
+
+  const paymentBlock =
+    `━━━━━━━━━━━━━━━━\n` +
+    `💰 <b>PAYMENT REQUIRED</b>\n\n` +
+    `Deal: #${esc(deal.inviteCode)}\n` +
+    acceptedByLine +
+    `Payment: <b>${esc(methodLabel)}</b>\n` +
+    payerLine +
+    `Amount to pay: <b>${formatMoney(totalPaid, isInr ? "INR" : deal.asset)}</b>\n\n` +
+    instructions +
+    rejectionLine +
+    `Only send to the details above. The escrower verifies payment manually.`;
+
+  const kb = new InlineKeyboard()
+    .text("\u{2705}  I've Paid", `deal:paid:${deal.id}`)
+    .row()
+    .text("\u{1F4CB}  View Status", `deal:status:${deal.id}`);
+
+  try {
+    await ctx.api.editMessageText(
+      deal.groupChatId,
+      deal.groupMessageId,
+      buildDealCard(deal, buyer, seller, dealCardStatusLabel(deal)) + "\n\n" + paymentBlock,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+  } catch (e) {
+    logger.warn({ dealId: deal.id, err: e }, "Failed to post payment instructions to group card");
+  }
+
+  try {
+    await prisma.escrowAuditLog.create({
+      data: {
+        dealId: deal.id,
+        action: "PAYMENT_INSTRUCTIONS_SENT",
+        notes: `Payment instructions posted to the group card (payer: @${payerUser?.username ?? "N/A"})`,
+      },
+    });
+  } catch (e) {
+    logger.warn({ dealId: deal.id, err: e }, "Failed to record PAYMENT_INSTRUCTIONS_SENT audit");
+  }
+}
+
+/**
  * Party clicks [✅ Agree to Deal] on the group card. The bot identifies the
  * Telegram user who clicked and records the agreement for THEIR party only.
  * After both parties agree, the card is re-rendered with [🛡 Accept Deal] and
@@ -922,14 +1047,9 @@ export async function handleAgreeToDeal(ctx: MyContext, dealId: string) {
       res.agreedBy === "BUYER" ? "Buyer agreed \u2705" : "Seller agreed \u2705"
     ).catch(() => {});
 
-    await ctx.reply(
-      `<b>AGREEMENT RECORDED</b>\n\n` +
-      `You agreed to the terms of deal #${esc(deal.inviteCode)}.\n\n` +
-      (res.bothAgreed
-        ? "🤝 <b>Both parties have agreed.</b>\n\nWaiting for the escrow admin to accept the deal."
-        : "The other party still needs to agree to the deal in the group.")
-    ).catch(() => {});
-
+    // The group card is the source of truth: it is re-rendered with the
+    // agreement status (and [🛡 Accept Deal] once both parties agree). No
+    // extra party DMs — only the admins are nudged in DM to accept.
     const updated = await dealService.findWithParties(dealId);
     if (updated) await updateGroupDealCard(ctx, updated);
 
@@ -948,16 +1068,6 @@ export async function handleAgreeToDeal(ctx: MyContext, dealId: string) {
         { dealId: updated.id }
       );
 
-      for (const party of [updated.buyer, updated.seller]) {
-        if (!party?.telegramId) continue;
-        await ctx.api.sendMessage(
-          Number(party.telegramId),
-          `🤝 <b>DEAL #${esc(updated.inviteCode)}</b>\n\n` +
-          `Both parties have agreed to the terms.\n\n` +
-          `Waiting for the escrow admin to accept the deal. You will receive payment instructions here once it is accepted.`,
-          { parse_mode: "HTML" }
-        ).catch(() => {});
-      }
     }
   } catch (e: unknown) {
     await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error").catch(() => {});

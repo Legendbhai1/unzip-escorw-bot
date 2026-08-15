@@ -56,6 +56,12 @@ export interface SessionData {
   // consumed in the same chat the prompt was sent to.
   pendingFlowChatId?: string;
 
+  // The bot's last temporary form prompt (message id + chat) so the next
+  // question can delete it. NEVER the group deal card — the card is the deal
+  // reference and is never deleted.
+  lastPromptChatId?: string;
+  lastPromptMessageId?: number;
+
   // ── Manual payment flow state ──
   // Buyer: awaiting payment reference / evidence after clicking "I've Paid"
   pendingPaymentReportDealId?: string;

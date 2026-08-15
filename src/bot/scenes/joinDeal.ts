@@ -141,7 +141,7 @@ export async function showDealStatus(ctx: Ctx, dealId: string) {
   const statusEmoji: Record<string, string> = {
     CREATED: "\u{1F9ED}", JOINED: "\u{1F91D}",
     AWAITING_PAYMENT: "\u{1F4B3}", PAYMENT_REPORTED: "\u{1F4DD}",
-    FUNDED: "\u{2705}", IN_PROGRESS: "\u{1F6E0}\u{FE0F}", DELIVERED: "\u{1F4E6}",
+    PAYMENT_RECEIVED: "\u{2705}", FUNDED: "\u{2705}", IN_PROGRESS: "\u{1F6E0}\u{FE0F}", DELIVERED: "\u{1F4E6}",
     RELEASE_PENDING: "\u{23F3}", RELEASE_REQUESTED: "\u{23F3}",
     RELEASED: "\u{1F4B8}", COMPLETED: "\u{2705}",
     DISPUTED: "\u{26A0}\u{FE0F}", UNDER_REVIEW: "\u{1F50D}",
@@ -153,9 +153,10 @@ export async function showDealStatus(ctx: Ctx, dealId: string) {
   const isBuyer = deal.buyerId === ctx.session.userId;
   const roleLabel = isBuyer ? "Buyer" : "Seller";
 
-  const paymentOk = ["FUNDED", "IN_PROGRESS", "DELIVERED", "RELEASE_PENDING", "RELEASE_REQUESTED", "RELEASED", "COMPLETED"].includes(deal.status);
-  const deliveryOk = ["DELIVERED", "RELEASE_PENDING", "RELEASE_REQUESTED", "RELEASED", "COMPLETED"].includes(deal.status);
-  const releaseOk = ["RELEASED", "COMPLETED"].includes(deal.status);
+  // The bot's scope ends when the escrow admin confirms PAYMENT RECEIVED —
+  // delivery/payout continue manually outside the bot, so the status view
+  // only tracks the payment milestone.
+  const paymentOk = ["PAYMENT_RECEIVED", "FUNDED", "IN_PROGRESS", "DELIVERED", "RELEASE_PENDING", "RELEASE_REQUESTED", "RELEASED", "COMPLETED"].includes(deal.status);
 
   const buyerFeePct = bpsToPercent(deal.buyerFeeBps ?? config.buyerFeeBps);
   const sellerFeePct = bpsToPercent(deal.sellerFeeBps ?? config.sellerFeeBps);
@@ -171,9 +172,7 @@ export async function showDealStatus(ctx: Ctx, dealId: string) {
     `Buyer fee: ${buyerFeePct}\n` +
     `Seller fee: ${sellerFeePct}\n\n` +
     `Item: ${esc(deal.description)}\n\n` +
-    `Payment: ${paymentOk ? "Verified" : "Pending"}\n` +
-    `Delivery: ${deliveryOk ? "Done" : "Pending"}\n` +
-    `Release: ${releaseOk ? "Done" : "Pending"}\n\n` +
+    `Payment: ${paymentOk ? "Received (escrower verified)" : "Pending"}\n\n` +
     `Created: ${deal.createdAt.toISOString().slice(0, 10)}`,
     { reply_markup: dealActions(deal.id, deal.status) }
   );

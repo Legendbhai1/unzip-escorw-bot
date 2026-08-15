@@ -225,7 +225,7 @@ export const dealService = {
     const rows = await tx.$queryRaw<Array<any>>(
       Prisma.sql`SELECT id, status, buyer_id, seller_id, amount, asset, network,
         currency, payment_method, crypto_payer, buyer_fee_bps, seller_fee_bps,
-        buyer_fee_amount, seller_fee_amount, accepted_at,
+        buyer_fee_amount, seller_fee_amount, accepted_at, accepted_by,
         buyer_agreed_at, seller_agreed_at,
         released_amount, refunded_amount, remaining_amount,
         release_requested_by, release_requested_amount, release_requested_from,
@@ -304,6 +304,10 @@ export const dealService = {
   async rejectPayment(dealId: string, adminUserId: string, reason: string) {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
+      // Only the admin who ACCEPTED the deal may reject its payment report.
+      if (d.accepted_by && d.accepted_by !== adminUserId) {
+        throw new Error("You are not the admin assigned to this deal.");
+      }
       const t = canTransition(d.status, "AWAITING_PAYMENT", "ADMIN");
       if (!t) throw new Error(`Cannot reject payment from ${d.status}`);
 
@@ -332,16 +336,26 @@ export const dealService = {
   },
 
   /**
-   * Escrower/admin MANUALLY verifies the payment OUTSIDE the bot and marks the
-   * deal FUNDED. This is the ONLY way a deal becomes FUNDED — the bot never
-   * infers payment from blockchain events, screenshots, "I paid" or hashes.
+   * The assigned escrow admin MANUALLY verifies the payment OUTSIDE the bot and
+   * marks the deal PAYMENT_RECEIVED — the terminal state of the current flow.
+   * This is the ONLY way a deal becomes PAYMENT_RECEIVED — the bot never infers
+   * payment from blockchain events, screenshots, "I paid" or hashes.
    * Fees are computed and recorded as FEE_RECORDED audit entries; no balance
    * or ledger mutation happens (the bot has no custody).
+   *
+   * SECURITY: only the admin who ACCEPTED the deal (acceptedBy) may verify its
+   * payment — another admin gets "You are not the admin assigned to this
+   * deal." This is enforced server-side, row-locked, never by trusting the
+   * callback. Legacy deals without an acceptedBy (pre-group flow) fall back to
+   * the caller passing the router-level admin authorization.
    */
   async verifyPayment(dealId: string, adminUserId: string, reference?: string) {
     return prisma.$transaction(async (tx) => {
       const d = await this._lockDeal(tx, dealId);
-      const t = canTransition(d.status, "FUNDED", "ADMIN");
+      if (d.accepted_by && d.accepted_by !== adminUserId) {
+        throw new Error("You are not the admin assigned to this deal.");
+      }
+      const t = canTransition(d.status, "PAYMENT_RECEIVED", "ADMIN");
       if (!t) throw new Error(`Cannot verify payment from ${d.status} (deal must be PAYMENT_REPORTED)`);
 
       const dealAmount = new Prisma.Decimal(d.amount);
@@ -362,19 +376,20 @@ export const dealService = {
       await tx.deal.update({
         where: { id: dealId },
         data: {
-          status: "FUNDED",
+          status: "PAYMENT_RECEIVED",
           buyerFeeAmount: buyerFee,
           paymentVerifiedAt: new Date(),
           paymentVerifiedBy: adminUserId,
+          completedAt: new Date(),
           ...(reference ? { paymentReference: reference } : {}),
         },
       });
 
       await tx.escrowAuditLog.create({
         data: {
-          dealId, action: "PAYMENT_VERIFIED", userId: adminUserId,
+          dealId, action: "PAYMENT_RECEIVED", userId: adminUserId,
           amount: dealAmount, currency: d.currency ?? d.asset,
-          reference: reference ?? null, notes: "Escrower manually verified payment outside the bot",
+          reference: reference ?? null, notes: "Assigned escrow admin manually verified payment outside the bot — deal flow ends here",
         },
       });
       await tx.escrowAuditLog.create({
@@ -393,7 +408,7 @@ export const dealService = {
         },
       });
 
-      logger.info({ dealId, adminUserId, buyerFee: buyerFee.toString() }, "Payment manually verified -> FUNDED");
+      logger.info({ dealId, adminUserId, buyerFee: buyerFee.toString() }, "Payment manually verified -> PAYMENT_RECEIVED (terminal)");
       return { dealId, buyerFee: buyerFee.toString(), totalPaid: totalPaid.toString() };
     });
   },

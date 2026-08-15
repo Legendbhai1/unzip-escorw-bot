@@ -7,10 +7,7 @@ import { dealService } from "../services/dealService.js";
 import { notificationService } from "../services/notificationService.js";
 import { mainMenu, backToMain, dealTabs } from "./keyboards/index.js";
 import { handleJoinDeal, handleAcceptDeal, showDealStatus } from "./scenes/joinDeal.js";
-import {
-  handleAcceptRelease, handleDeliver, handleDispute, handleDisputeReason,
-  handleReleaseCommand, handleRefundCommand, handleReleaseAgree, handleRefundAgree,
-} from "./scenes/depositDeliveryRelease.js";
+import { handleDispute, handleDisputeReason } from "./scenes/depositDeliveryRelease.js";
 import { showHistory, showMyDeals } from "./scenes/walletAndDeals.js";
 import {
   startDealForm, processDealFormCallback, processDealFormText,
@@ -22,7 +19,7 @@ import { isDealChatValid } from "../lib/flow.js";
 import { canTransition } from "../lib/stateMachine.js";
 import type { MyContext, SessionData } from "./context.js";
 import { adminDashboard, listDisputes, reviewDispute, handleAdminCallback, banUser, suspendUser, lookupUser, setSettingValue } from "./admin.js";
-import { updateGroupDealCard } from "./scenes/dealForm.js";
+import { updateGroupDealCard, postPaymentInstructionsToGroupCard } from "./scenes/dealForm.js";
 
 // ─── Bot Setup ────────────────────────────────────────────────────────
 const bot = new Bot<MyContext>(config.botToken);
@@ -166,39 +163,23 @@ bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
   await startDealForm(ctx);
 });
 
-// ─── /release and /refund (partial or all, resolved from deal context) ──
+// ── /release and /refund are OUT OF SCOPE ────────────────────────
+// The bot's scope ends when the assigned escrow admin confirms PAYMENT
+// RECEIVED. Delivery, payout and refunds continue manually outside the bot —
+// the commands are kept registered only to give a clear answer instead of an
+// unknown-command error. They never touch a deal.
 bot.command("release", async (ctx) => {
-  const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
-  const amount = parts.find((p) => /^\d+(\.\d{1,8})?$/.test(p));
-  const codeArg = parts.find((p) => /^[A-Za-z0-9]+$/.test(p) && p !== amount);
-  const deal = await resolveDealFromContext(ctx, codeArg);
-  if (!deal) {
-    await ctx.reply(
-      "<b>RELEASE</b>\n\nReply to the deal message, or send:\n" +
-      "<code>/release all</code> — full remaining amount\n" +
-      "<code>/release 50</code> — partial amount\n\n" +
-      "In DM you can also pass the deal code: <code>/release all ABC12345</code>"
-    );
-    return;
-  }
-  await handleReleaseCommand(ctx, deal, amount);
+  await ctx.reply(
+    "Release is handled manually by the escrower outside the bot.\n\n" +
+    "The bot's job ends once the escrow admin confirms <b>PAYMENT RECEIVED</b>."
+  );
 });
 
 bot.command("refund", async (ctx) => {
-  const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
-  const amount = parts.find((p) => /^\d+(\.\d{1,8})?$/.test(p));
-  const codeArg = parts.find((p) => /^[A-Za-z0-9]+$/.test(p) && p !== amount);
-  const deal = await resolveDealFromContext(ctx, codeArg);
-  if (!deal) {
-    await ctx.reply(
-      "<b>REFUND</b>\n\nReply to the deal message, or send:\n" +
-      "<code>/refund all</code> — full remaining amount\n" +
-      "<code>/refund 50</code> — partial amount\n\n" +
-      "In DM you can also pass the deal code: <code>/refund all ABC12345</code>"
-    );
-    return;
-  }
-  await handleRefundCommand(ctx, deal, amount);
+  await ctx.reply(
+    "Refunds are handled manually by the escrower outside the bot.\n\n" +
+    "The bot's job ends once the escrow admin confirms <b>PAYMENT RECEIVED</b>."
+  );
 });
 
 // ─── Admin payment settings ────────────────────────────────────────
@@ -445,10 +426,7 @@ bot.on("callback_query:data", async (ctx) => {
       "5. Buyer (or the configured crypto payer) pays the escrower directly (UPI or crypto)\n" +
       "6. The payer taps \"I've Paid\"\n" +
       "7. The escrower personally verifies the payment\n" +
-      "8. Seller delivers the item/service\n" +
-      "9. Buyer accepts; the escrower manually pays the seller\n" +
-      "10. Deal is marked completed\n\n" +
-      "If anything goes wrong, either party can open a dispute.\n\n" +
+      "8. Payment received — the bot's job is done; delivery and payout continue manually\n\n" +
       "🔐 The bot never holds, sends or withdraws funds.",
       { reply_markup: backToMain }
     );
@@ -531,41 +509,14 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // ── Deal: Accept & Release (requests manual release — no auto payout) ──
-  if (data.startsWith("deal:release:")) {
-    const dealId = data.split(":")[2];
-    ctx.session.lastDealId = dealId;
-    await handleAcceptRelease(ctx, dealId);
-    return;
-  }
-
-  // ── Deal: Release / Refund agreement callbacks ──
-  if (data.startsWith("deal:release_agree:")) {
-    const dealId = data.split(":")[2];
-    await handleReleaseAgree(ctx, dealId, true);
-    return;
-  }
-  if (data.startsWith("deal:release_reject:")) {
-    const dealId = data.split(":")[2];
-    await handleReleaseAgree(ctx, dealId, false);
-    return;
-  }
-  if (data.startsWith("deal:refund_agree:")) {
-    const dealId = data.split(":")[2];
-    await handleRefundAgree(ctx, dealId, true);
-    return;
-  }
-  if (data.startsWith("deal:refund_reject:")) {
-    const dealId = data.split(":")[2];
-    await handleRefundAgree(ctx, dealId, false);
-    return;
-  }
-
-  // ── Deal: Deliver ──
-  if (data.startsWith("deal:deliver:")) {
-    const dealId = data.split(":")[2];
-    ctx.session.lastDealId = dealId;
-    await handleDeliver(ctx, dealId);
+  // ── Deal: Release / Refund / Delivery are OUT OF SCOPE ──
+  // The bot's flow ends at PAYMENT_RECEIVED. Old buttons from the previous
+  // release/refund/delivery automation (kept for historical rows) are answered
+  // with a clear message and never act on the deal.
+  if (data.startsWith("deal:release:") || data.startsWith("deal:release_agree:") ||
+      data.startsWith("deal:release_reject:") || data.startsWith("deal:refund_agree:") ||
+      data.startsWith("deal:refund_reject:") || data.startsWith("deal:deliver:")) {
+    await ctx.answerCallbackQuery("This action is no longer available.").catch(() => {});
     return;
   }
 
@@ -681,15 +632,10 @@ bot.on("message:text", async (ctx, next) => {
       await dealService.rejectPayment(dealId, ctx.session.userId, text);
       const deal = await dealService.findWithParties(dealId);
       await ctx.reply(`Payment report rejected for deal #${esc(deal?.inviteCode ?? dealId)}.`);
-      if (deal?.buyer?.telegramId) {
-        await ctx.api.sendMessage(
-          Number(deal.buyer.telegramId),
-          `<b>PAYMENT REJECTED</b>\n\nDeal #${esc(deal.inviteCode)}\nThe escrower could not verify your payment.\n\nReason: ${esc(text)}\n\nYou can pay again and re-report.`,
-          {
-            parse_mode: "HTML",
-            reply_markup: new InlineKeyboard().text("\u{2705}  I've Paid", `deal:paid:${dealId}`),
-          }
-        );
+      // GROUP-FIRST: the group card is re-rendered with PAYMENT REQUIRED, the
+      // rejection reason and a fresh [I've Paid] button for the payer.
+      if (deal) {
+        await postPaymentInstructionsToGroupCard(ctx, deal, undefined, text);
       }
     } catch (e: unknown) {
       await ctx.reply(esc(e instanceof Error ? e.message : "Could not reject payment"));
@@ -832,18 +778,26 @@ async function completePaymentReport(
       { reply_markup: backToMain }
     );
 
-    await notificationService.notifyAdmins(
-      `<b>BUYER REPORTED PAYMENT</b>\n\n` +
+    // GROUP-FIRST: the group card flips to PAYMENT REPORTED (the [I've Paid]
+    // button is removed; verification happens only via the assigned admin's DM).
+    if (deal) await updateGroupDealCard(ctx, deal);
+
+    // ONLY the admin who accepted this deal gets the verification buttons —
+    // other admins are never notified and their callbacks are rejected
+    // server-side (see admin.ts isAssignedVerifier).
+    await notificationService.notifyAssignedAdmin(
+      `<b>PAYMENT CHECK</b>\n\n` +
       `Deal: #${esc(deal?.inviteCode ?? dealId)}\n` +
+      `Payer: @${esc(ctx.session.username ?? ctx.session.firstName)}\n` +
       `Amount: <b>${esc(deal?.amount?.toString() ?? "")} ${esc(deal?.asset ?? "")}</b>\n` +
-      `Payment: ${esc(deal?.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}\n` +
-      `Reported by: @${esc(ctx.session.username ?? ctx.session.firstName)}${opts.reference ? `\nReference: <code>${esc(opts.reference)}</code>` : ""}${opts.evidence ? "\n📎 Screenshot attached" : ""}`,
+      `Payment: ${esc(deal?.paymentMethod === "INR" ? "INR / UPI" : "Crypto")}${opts.reference ? `\nReference: <code>${esc(opts.reference)}</code>` : ""}${opts.evidence ? "\n📎 Screenshot attached" : ""}\n\n` +
+      `Please check the payment manually.`,
       new InlineKeyboard()
         .text("\u{2705}  Payment Received", `admin:verify_payment:${dealId}`)
-        .text("\u{274C}  Payment Not Received", `admin:reject_payment:${dealId}`)
+        .text("\u{274C}  Not Received", `admin:reject_payment:${dealId}`)
         .row()
         .text("\u{1F50D}  Request Evidence", `admin:request_evidence:${dealId}`),
-      { dealId }
+      dealId
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Unknown error";
@@ -890,11 +844,11 @@ async function submitEvidence(ctx: MyContext, dealId: string, text: string, file
       { reply_markup: backToMain }
     );
 
-    await notificationService.notifyAdmins(
+    await notificationService.notifyAssignedAdmin(
       `<b>EVIDENCE SUBMITTED</b>\n\nDeal: #${esc(dealId)}\nBy: @${esc(ctx.session.username ?? ctx.session.firstName)}\n` +
       (fileId ? "📎 Screenshot attached." : `Notes: ${esc(text)}`),
       new InlineKeyboard().text("Review", `admin:verify_payment:${dealId}`),
-      { dealId }
+      dealId
     );
   } catch (e: unknown) {
     await ctx.reply(esc(e instanceof Error ? e.message : "Could not submit evidence"), { reply_markup: backToMain });

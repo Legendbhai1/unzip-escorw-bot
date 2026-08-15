@@ -51,7 +51,7 @@ export const notificationService = {
         `Amount: <b>${esc(amountStr)}</b>\n` +
         `Item: ${esc(description.slice(0, 100))}\n\n` +
         `🔐 Payment is manually verified by the escrower.\n\n` +
-        `The deal has been posted to the escrow group. Please <b>agree to the deal there</b> so the escrow admin can accept it. You will receive payment instructions here once it is accepted.`,
+        `The deal card has been posted to the escrow group. Please <b>agree to the deal there</b> so the escrow admin can accept it. The payment instructions will be posted on the deal card in the group once the admin accepts.`,
         { parse_mode: "HTML" }
       );
     } catch (e) {
@@ -98,6 +98,44 @@ export const notificationService = {
       } catch (e) {
         logger.warn({ tid, err: e }, "Failed to notify admin");
       }
+    }
+  },
+
+  /**
+   * Notify ONLY the admin who ACCEPTED the deal (acceptedBy) — the only admin
+   * allowed to verify its payment. Other admins are deliberately NOT notified:
+   * the payment-verification buttons never reach them and their callbacks are
+   * rejected server-side anyway. Legacy deals without an acceptedBy fall back
+   * to notifyAdmins (all configured admins) so old pending reports stay
+   * actionable.
+   */
+  async notifyAssignedAdmin(message: string, replyMarkup?: unknown, dealId?: string) {
+    if (!dealId) {
+      await this.notifyAdmins(message, replyMarkup);
+      return;
+    }
+    const deal = await prisma.deal.findUnique({
+      where: { id: dealId },
+      select: { acceptedBy: true, groupChatId: true },
+    }).catch(() => null);
+    if (!deal?.acceptedBy) {
+      // Legacy row without an accepting admin — fall back to all admins.
+      await this.notifyAdmins(message, replyMarkup, { dealId });
+      return;
+    }
+    const user = await prisma.user.findUnique({ where: { id: deal.acceptedBy } }).catch(() => null);
+    if (!user) {
+      await this.notifyAdmins(message, replyMarkup, { dealId });
+      return;
+    }
+    const b = await getBot();
+    try {
+      await b.api.sendMessage(Number(user.telegramId), message, {
+        parse_mode: "HTML",
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+    } catch (e) {
+      logger.warn({ dealId, err: e }, "Failed to notify the assigned admin");
     }
   },
 
