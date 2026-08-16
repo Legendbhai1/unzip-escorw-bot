@@ -11,7 +11,7 @@ import { esc, userMention } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
 import { parseDurationDeadline } from "../../lib/dealTerms.js";
 import { newFlowToken, isFlowExpired, isFlowChatValid, isDealChatValid, splitCallbackToken, FLOW_TTL_MS } from "../../lib/flow.js";
-import { getPaymentInstructionsText, hasPaymentInstructions } from "../../lib/paymentInstructions.js";
+import { getPaymentInstructionsText, hasPaymentInstructions, UNAVAILABLE_MESSAGE } from "../../lib/paymentInstructions.js";
 import { activeFormOptions, backToMain } from "../keyboards/index.js";
 import type { MyContext } from "../context.js";
 
@@ -969,7 +969,7 @@ export async function postPaymentInstructionsToGroupCard(
   const methodLabel = deal.paymentMethod === "INR" ? "INR / UPI" : "USDT BEP20";
   const instructions = configured
     ? `💳 <b>How to pay:</b>\n${await getPaymentInstructionsText(deal)}\n`
-    : `❌ <b>${deal.paymentMethod === "INR" ? "UPI" : "USDT BEP20"} payment isn't configured for this group.</b>\nAsk an admin to run /settings.\n`;
+    : `❌ <b>${UNAVAILABLE_MESSAGE}</b>\n`;
 
   const acceptedByLine = acceptedByUsername ? `Accepted by: @${esc(acceptedByUsername)}\n` : "";
   const payerLine = deal.paymentMethod !== "INR"

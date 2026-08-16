@@ -103,15 +103,17 @@ export const notificationService = {
 
   /**
    * Notify ONLY the admin who ACCEPTED the deal (acceptedBy) — the only admin
-   * allowed to verify its payment. Other admins are deliberately NOT notified:
-   * the payment-verification buttons never reach them and their callbacks are
-   * rejected server-side anyway. Legacy deals without an acceptedBy fall back
-   * to notifyAdmins (all configured admins) so old pending reports stay
-   * actionable.
+   * allowed to verify its payment. The payment-verification buttons NEVER
+   * reach global admins or other group admins: in every fallback path (no
+   * deal, no acceptedBy, unknown verifier user) the message is sent WITHOUT
+   * the verification keyboard so the "Payment Received" button stays with the
+   * accepting admin alone. Callbacks from anyone else are rejected server-side
+   * anyway (see admin.ts isAssignedVerifier).
    */
   async notifyAssignedAdmin(message: string, replyMarkup?: unknown, dealId?: string) {
     if (!dealId) {
-      await this.notifyAdmins(message, replyMarkup);
+      // No deal context — inform admins, but never with verification buttons.
+      await this.notifyAdmins(message, undefined);
       return;
     }
     const deal = await prisma.deal.findUnique({
@@ -119,13 +121,14 @@ export const notificationService = {
       select: { acceptedBy: true, groupChatId: true },
     }).catch(() => null);
     if (!deal?.acceptedBy) {
-      // Legacy row without an accepting admin — fall back to all admins.
-      await this.notifyAdmins(message, replyMarkup, { dealId });
+      // Legacy row without an accepting admin — admins are informed of the
+      // report but the verification buttons are NOT included.
+      await this.notifyAdmins(message, undefined, { dealId });
       return;
     }
     const user = await prisma.user.findUnique({ where: { id: deal.acceptedBy } }).catch(() => null);
     if (!user) {
-      await this.notifyAdmins(message, replyMarkup, { dealId });
+      await this.notifyAdmins(message, undefined, { dealId });
       return;
     }
     const b = await getBot();

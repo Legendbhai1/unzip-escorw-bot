@@ -5,7 +5,7 @@ import { acceptRejectDeal, backToMain, dealActions } from "../keyboards/index.js
 import { config } from "../../config/index.js";
 import { esc } from "../../lib/html.js";
 import { formatMoney, bpsToPercent } from "../../lib/money.js";
-import { getPaymentInstructionsText, hasPaymentInstructions } from "../../lib/paymentInstructions.js";
+import { getPaymentInstructionsText, hasPaymentInstructions, UNAVAILABLE_MESSAGE } from "../../lib/paymentInstructions.js";
 
 type Ctx = any;
 
@@ -123,12 +123,13 @@ export async function handleAcceptDeal(ctx: Ctx) {
 }
 
 /** Payment instructions block — configured escrower details or a clear
- *  "unavailable" fallback. NEVER an auto-generated address. */
+ *  "not configured for this group" fallback. NEVER an auto-generated
+ *  address and never another group's / global payment details. */
 async function paymentInstructionsBlock(deal: any): Promise<string> {
   if (await hasPaymentInstructions(deal)) {
     return `💳 <b>How to pay:</b>\n${await getPaymentInstructionsText(deal)}`;
   }
-  return "Payment method is currently unavailable. Please contact an admin.";
+  return UNAVAILABLE_MESSAGE;
 }
 
 export async function showDealStatus(ctx: Ctx, dealId: string) {

@@ -144,23 +144,28 @@ describe("isFlowExpired", () => {
 // ═══════════════════════════════════════════════════════════════════
 
 describe("per-group payment settings", () => {
-  it("each group has its own UPI details; groups without details fall back to global", async () => {
+  it("each group has its own UPI details; groups without details do NOT fall back to global settings", async () => {
     await setAdminSetting(SETTING_KEYS.upiId, "global@upi.example", ADMIN_ID, GLOBAL_GROUP_ID);
     await setAdminSetting(SETTING_KEYS.upiId, "groupA@upi.example", ADMIN_ID, GROUP_A);
 
     expect(await getAdminSetting(SETTING_KEYS.upiId, GROUP_A)).toBe("groupA@upi.example");
-    // Group B has no row of its own → the global fallback is used.
-    expect(await getAdminSetting(SETTING_KEYS.upiId, GROUP_B)).toBe("global@upi.example");
+    // Group B has no row of its own → it does NOT inherit the global DB row
+    // (only the deployment-level env default applies, for backward compat).
+    expect(await getAdminSetting(SETTING_KEYS.upiId, GROUP_B)).toBe("escrow@upi.example");
+    expect(await getAdminSetting(SETTING_KEYS.upiId, GROUP_B)).not.toBe("global@upi.example");
     expect(await getAdminSetting(SETTING_KEYS.upiId, GLOBAL_GROUP_ID)).toBe("global@upi.example");
   });
 
-  it("removing a group's row restores the global fallback for that group", async () => {
+  it("removing a group's row does NOT restore the global fallback for that group", async () => {
     await setAdminSetting(SETTING_KEYS.usdtBep20Address, "0xGlobal", ADMIN_ID, GLOBAL_GROUP_ID);
     await setAdminSetting(SETTING_KEYS.usdtBep20Address, "0xGroupA", ADMIN_ID, GROUP_A);
 
     expect(await getAdminSetting(SETTING_KEYS.usdtBep20Address, GROUP_A)).toBe("0xGroupA");
     await deleteAdminSetting(SETTING_KEYS.usdtBep20Address, GROUP_A);
-    expect(await getAdminSetting(SETTING_KEYS.usdtBep20Address, GROUP_A)).toBe("0xGlobal");
+    // Group A no longer has its own row → it does NOT inherit the global row;
+    // only the env default applies.
+    expect(await getAdminSetting(SETTING_KEYS.usdtBep20Address, GROUP_A)).toBe("0xTestEscrowerBep20Address0000000000000000000001");
+    expect(await getAdminSetting(SETTING_KEYS.usdtBep20Address, GROUP_A)).not.toBe("0xGlobal");
     // The global row is untouched.
     expect(await getAdminSetting(SETTING_KEYS.usdtBep20Address, GLOBAL_GROUP_ID)).toBe("0xGlobal");
   });
@@ -176,7 +181,8 @@ describe("per-group payment settings", () => {
     const dealInB = { asset: "INR", network: "UPI", paymentMethod: "INR", groupChatId: GROUP_B };
 
     expect(await getPaymentInstructionsText(dealInA)).toContain("groupA@upi.example");
-    // Deal in group B: no group B row → global env fallback is used.
+    // Deal in group B: no group B row → deployment env default applies (never
+    // the global DB row or another group's details).
     expect(await getPaymentInstructionsText(dealInB)).toContain("escrow@upi.example");
     expect(await hasPaymentInstructions(dealInA)).toBe(true);
   });

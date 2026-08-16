@@ -3,7 +3,7 @@ import { PrismaClient, Prisma } from "@prisma/client";
 import { dealService } from "../src/services/dealService.js";
 import { userService } from "../src/services/userService.js";
 import { canTransition, DISPUTABLE_STATES, TERMINAL_STATES, ACTIVE_STATES } from "../src/lib/stateMachine.js";
-import { getPaymentInstructionsText } from "../src/lib/paymentInstructions.js";
+import { getPaymentInstructionsText, UNAVAILABLE_MESSAGE } from "../src/lib/paymentInstructions.js";
 import { config } from "../src/config/index.js";
 
 const prisma = new PrismaClient();
@@ -151,12 +151,12 @@ describe("Payment instructions (admin settings / env fallback, never generated)"
 
   it("USDT on TRC20 is NOT supported -> unavailable", async () => {
     const text = await getPaymentInstructionsText({ asset: "USDT", network: "TRC20", paymentMethod: "CRYPTO" });
-    expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
+    expect(text).toBe(UNAVAILABLE_MESSAGE);
   });
 
   it("never fabricates an address: unknown denomination -> unavailable", async () => {
     const text = await getPaymentInstructionsText({ asset: "BTC", network: "LIGHTNING", paymentMethod: "CRYPTO" });
-    expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
+    expect(text).toBe(UNAVAILABLE_MESSAGE);
   });
 
   it("DB admin settings override the env fallback", async () => {
@@ -174,7 +174,7 @@ describe("Payment instructions (admin settings / env fallback, never generated)"
     (config as any).escrow = { upiId: "", upiName: "", cryptoAddresses: {} };
     try {
       const text = await getPaymentInstructionsText({ asset: "INR", network: "UPI", paymentMethod: "INR" });
-      expect(text).toBe("Payment method is currently unavailable. Please contact an admin.");
+      expect(text).toBe(UNAVAILABLE_MESSAGE);
     } finally {
       (config as any).escrow = saved;
     }

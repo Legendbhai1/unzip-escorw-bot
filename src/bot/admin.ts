@@ -151,12 +151,18 @@ async function listPendingPayments(ctx: MyContext) {
 
   for (const deal of deals) {
     const report = deal.paymentReports[0];
-    // ONLY the admin who accepted this deal may verify it — everyone else sees
-    // a read-only entry (the verification buttons never reach another admin).
-    const isVerifier = !deal.acceptedBy || deal.acceptedBy === ctx.session.userId;
-    const assignedUsername = !isVerifier && deal.acceptedBy
+    // The Payment Received button reaches ONLY the admin who ACCEPTED this
+    // deal (acceptedBy). Other admins — including global admins and other
+    // group admins — see a read-only entry with a View Deal button. Legacy
+    // rows without an acceptedBy have no assigned verifier, so nobody gets
+    // the verification buttons for them.
+    const isVerifier = Boolean(deal.acceptedBy) && deal.acceptedBy === ctx.session.userId;
+    const assignedUsername = deal.acceptedBy
       ? (await userService.findById(deal.acceptedBy).catch(() => null))?.username
       : undefined;
+    const assignedNote = assignedUsername
+      ? `\n⚠️ Verification is assigned to @${esc(assignedUsername)} — only they can confirm this payment.\n`
+      : "\n⚠️ This deal has no assigned accepting admin — payment verification is locked.\n";
 
     const kb = isVerifier
       ? new InlineKeyboard()
@@ -176,7 +182,7 @@ async function listPendingPayments(ctx: MyContext) {
       (report?.reference ? `Reference: <code>${esc(report.reference)}</code>\n` : "") +
       (report?.notes ? `Notes: ${esc(report.notes)}\n` : "") +
       (report?.evidence ? `Evidence: ${esc(report.evidence)}\n` : "") +
-      (assignedUsername ? `\n⚠️ Verification is assigned to @${esc(assignedUsername)} — only they can confirm this payment.\n` : ""),
+      (deal.acceptedBy && !isVerifier ? assignedNote : ""),
       { reply_markup: kb }
     );
   }
@@ -270,6 +276,15 @@ export async function handleAdminCallback(ctx: MyContext) {
   // ── Payment settings (admin-entered escrow receiving details) ──
   if (settingsScope) {
     const groupId = settingsScope.groupId;
+    // GROUP-ONLY: payment configuration belongs to each authorized escrow
+    // group. The global DM panel is not available — there is no global
+    // fallback that groups could inherit.
+    if (groupId === GLOBAL_GROUP_ID) {
+      await ctx.answerCallbackQuery(
+        "Payment settings are configured per escrow group — run /settings inside the group."
+      ).catch(() => {});
+      return;
+    }
     if (data === "admin:settings") {
       await showSettings(ctx, groupId);
       await ctx.answerCallbackQuery();
@@ -315,7 +330,7 @@ export async function handleAdminCallback(ctx: MyContext) {
       logger.info({ adminUserId: ctx.session.userId, groupId }, "Admin removed the USDT BEP20 escrow address");
       await ctx.editMessageText(
         "🗑 <b>USDT BEP20 address removed.</b>\n\n" +
-        "Users will see \"Payment method is currently unavailable\" until a new address is set.",
+        "Users will see \"Payment method is not configured for this group\" until a new address is set.",
         { reply_markup: new InlineKeyboard().text("Back", groupId ? `admin:settings_g:${groupId}` : "admin:settings") }
       );
       return;
@@ -443,10 +458,23 @@ export async function handleAdminCallback(ctx: MyContext) {
 
       // GROUP-FIRST: the group deal card is updated to the terminal
       // PAYMENT_RECEIVED state ("🟢 PAYMENT RECEIVED ✅ — CONTINUE THE DEAL
-      // MANUALLY") and the bot stops. No party DMs, no release/refund/
-      // delivery buttons.
+      // MANUALLY") and the bot stops. Then BOTH participants get one short
+      // green confirmation DM (no buttons, no follow-up flow) — this is the
+      // terminal notification of the deal; delivery/payout continue manually
+      // outside the bot.
       if (deal) {
         await updateGroupDealCard(ctx, deal);
+        const confirmedBy = ctx.session.username ?? ctx.session.firstName ?? "escrow admin";
+        const finalMsg =
+          `🟢 <b>PAYMENT RECEIVED</b>\n\n` +
+          `Deal #${esc(deal.inviteCode)}\n\n` +
+          `Payment has been confirmed by @${esc(confirmedBy)}.\n\n` +
+          `You can continue the deal manually.`;
+        for (const party of [deal.buyer, deal.seller]) {
+          if (party?.telegramId) {
+            await ctx.api.sendMessage(Number(party.telegramId), finalMsg, { parse_mode: "HTML" }).catch(() => {});
+          }
+        }
       }
     } catch (e: unknown) {
       await ctx.answerCallbackQuery(e instanceof Error ? e.message : "Error");
@@ -891,8 +919,8 @@ export async function buildSettingsPanel(groupId: string, groupTitle?: string) {
     `Name: <code>${esc(upiName || "— not set —")}</code>\n\n` +
     `🪙 <b>USDT BEP20</b>\n` +
     `Address: <code>${esc(usdt || "— not set —")}</code>\n\n` +
-    `If a payment method has no details here, the global fallback (if any) is used; ` +
-    `otherwise users see \"Payment method is currently unavailable. Please contact an admin.\"`;
+    `If a payment method has no details for this group, users see:\n` +
+    `\"Payment method is not configured for this group. Ask an escrow admin to run /settings.\"`;
 
   return { text, keyboard };
 }

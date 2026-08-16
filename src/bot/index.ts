@@ -169,36 +169,34 @@ bot.hears(/^\s*\/?form\s*$/i, async (ctx) => {
 // the commands are kept registered only to give a clear answer instead of an
 // unknown-command error. They never touch a deal.
 bot.command("release", async (ctx) => {
-  await ctx.reply(
-    "Release is handled manually by the escrower outside the bot.\n\n" +
-    "The bot's job ends once the escrow admin confirms <b>PAYMENT RECEIVED</b>."
-  );
+  await ctx.reply("This command isn't available in the current deal flow.");
 });
 
 bot.command("refund", async (ctx) => {
-  await ctx.reply(
-    "Refunds are handled manually by the escrower outside the bot.\n\n" +
-    "The bot's job ends once the escrow admin confirms <b>PAYMENT RECEIVED</b>."
-  );
+  await ctx.reply("This command isn't available in the current deal flow.");
 });
 
 // ─── Admin payment settings ────────────────────────────────────────
-// In DM: global admins edit the GLOBAL fallback details. Inside a group: the
-// bot owner, a global admin, or THAT group's escrow admin can configure the
-// group's OWN receiving details (never another group's).
+// GROUP-ONLY: payment details are configured per authorized escrow group, so
+// /settings must be run INSIDE the group (by the bot owner, a global admin, or
+// THAT group's escrow admin). DM-based payment configuration is not allowed —
+// there is no global fallback panel, and a group without its own details shows
+// "Payment method is not configured for this group."
 bot.command("settings", async (ctx) => {
   if (!ctx.from) {
     await ctx.reply("Unauthorized.");
     return;
   }
-  if (isGroupChat(ctx)) {
-    const ok = await groupService.isAuthorizedForGroup(ctx.from.id, String(ctx.chat.id));
-    if (!ok) {
-      await ctx.reply("Unauthorized — only the bot owner, a global admin or this group's escrow admin can change its payment details.");
-      return;
-    }
-  } else if (!config.adminTelegramIds.has(ctx.from.id)) {
-    await ctx.reply("Unauthorized.");
+  if (!isGroupChat(ctx)) {
+    await ctx.reply(
+      "Payment settings are configured per escrow group.\n\n" +
+      "Run <code>/settings</code> <b>inside</b> the authorized escrow group to set that group's UPI / USDT BEP20 details."
+    );
+    return;
+  }
+  const ok = await groupService.isAuthorizedForGroup(ctx.from.id, String(ctx.chat.id));
+  if (!ok) {
+    await ctx.reply("Unauthorized — only the bot owner, a global admin or this group's escrow admin can change its payment details.");
     return;
   }
   await adminPaymentSettings(ctx);

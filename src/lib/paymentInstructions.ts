@@ -23,10 +23,14 @@ export const SETTING_KEYS = {
 export const GLOBAL_GROUP_ID = "";
 
 /**
- * Read one admin setting for a scope. groupId "" = global. Resolution order:
- *   1. the group's own row (when groupId is non-empty)
- *   2. the global DB row ("" scope)
- *   3. the env fallback (global only)
+ * Read one admin setting for a scope. groupId "" = global (legacy/global-only
+ * rows such as escrow_group_id). Resolution order for a GROUP scope:
+ *   1. THAT group's own row ONLY
+ *   2. the env fallback (backward compatibility — deployment-level default)
+ * There is NO fallback to another group's row and NO fallback to the global
+ * DB row: payment details belong to the group a deal is posted in. A group
+ * without its own details shows "not configured for this group" unless the
+ * deployment env default applies.
  */
 export async function getAdminSetting(key: string, groupId: string = GLOBAL_GROUP_ID): Promise<string> {
   try {
@@ -34,17 +38,13 @@ export async function getAdminSetting(key: string, groupId: string = GLOBAL_GROU
       where: { key_groupId: { key, groupId } },
     });
     if (row?.value?.trim()) return row.value.trim();
-    if (groupId !== GLOBAL_GROUP_ID) {
-      const global = await prisma.adminSetting.findUnique({
-        where: { key_groupId: { key, groupId: GLOBAL_GROUP_ID } },
-      });
-      if (global?.value?.trim()) return global.value.trim();
-    }
   } catch {
     /* DB unavailable — fall through to env */
   }
   // Env vars (ESCROW_UPI_ID etc.) are the deployment-level default: they apply
-  // at every scope until an admin enters group-specific (or global) details.
+  // at every scope until an admin enters group-specific details. An explicitly
+  // configured group setting ALWAYS wins (checked above) and never falls back
+  // to the global DB row or another group's row.
   if (key === SETTING_KEYS.upiId) return config.escrow.upiId.trim();
   if (key === SETTING_KEYS.upiName) return config.escrow.upiName.trim();
   if (key === SETTING_KEYS.usdtBep20Address) return (config.escrow.cryptoAddresses["USDT_BEP20"] ?? "").trim();
@@ -82,7 +82,7 @@ export async function getEscrowGroupId(): Promise<string> {
 }
 
 export const UNAVAILABLE_MESSAGE =
-  "Payment method is currently unavailable. Please contact an admin.";
+  "Payment method is not configured for this group. Ask an escrow admin to run /settings.";
 
 /**
  * Resolve the scope a deal's payment instructions come from: the group the
